@@ -1,0 +1,6 @@
+[default.extend-words]
+# Julia / SciML jargon that the typo checker would otherwise flag.
+ND = "ND"
+
+[files]
+extend-exclude = ["*.jl.cov", "Manifest.toml"]

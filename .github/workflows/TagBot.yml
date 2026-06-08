@@ -1,0 +1,17 @@
+name: TagBot
+on:
+  issue_comment:
+    types:
+      - created
+  workflow_dispatch:
+    inputs:
+      lookback:
+        description: "TagBot lookback window in days (manual runs)."
+        default: "3"
+jobs:
+  TagBot:
+    name: "TagBot"
+    uses: "SciML/.github/.github/workflows/tagbot.yml@v1"
+    with:
+      lookback: "${{ github.event.inputs.lookback || '3' }}"
+    secrets: "inherit"
