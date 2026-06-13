@@ -40,7 +40,7 @@ test = ["Test", "SciMLTesting", ...]
 
 | Helper | Summary |
 | --- | --- |
-| `run_tests(; core, groups, qa, env, default, lib_dir, parent, pkg)` | Declarative top-level dispatcher: owns the whole `runtests.jl` group-routing flow. |
+| `run_tests(; core, groups, qa, env, default, sublib_env, all, umbrellas, lib_dir, parent, pkg)` | Declarative top-level dispatcher: owns the whole `runtests.jl` group-routing flow. |
 | `current_group(; env = "GROUP", default = "All")` | Read the test-group env var, defaulting to `"All"` (empty string also normalizes to the default). |
 | `activate_group_env(group_dir; parent, develop, instantiate, develop_sources)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. |
 | `develop_sources!(group_dir; parent)` | On Julia < 1.11, `Pkg.develop` the env's `[sources]` path graph (recursively); a no-op on 1.11+. |
@@ -112,6 +112,59 @@ to the root bodies:
 using SciMLTesting
 run_tests(;
     core = joinpath(@__DIR__, "core_tests.jl"),
+    lib_dir = joinpath(@__DIR__, "..", "lib"),
+)
+```
+
+#### Complex monorepos: `sublib_env`, curated `all`, umbrella groups
+
+Some monorepo roots (OrdinaryDiffEq.jl, RecursiveArrayTools.jl, ...) need control
+flow that a uniform `GROUP` dispatch cannot express. Three optional kwargs cover
+them; all default to the v1.0.0 behavior, so existing callers are unchanged.
+
+  * **`sublib_env`** — the env var the sublibrary handoff sets, defaulting to `env`.
+    OrdinaryDiffEq's root reads `GROUP` to pick a sublibrary, but the sublibraries
+    read `ODEDIFFEQ_TEST_GROUP`. Set `sublib_env = "ODEDIFFEQ_TEST_GROUP"`: the root
+    still reads `env` (`GROUP`) to select the sublibrary, but the sub-group is handed
+    off via `withenv(sublib_env => subgroup)`, not `env`.
+
+  * **`all`** — a curated list of the group keys `"All"` runs, replacing the
+    hardwired "`core` + every env-less group + `qa`". `core` runs under `"All"` only
+    if `"Core"` is listed, and `qa` only if `"QA"` is listed — so a repo can exclude
+    `qa` and heavy groups (OrdinaryDiffEq's `"All"` excludes `AlgConvergence_*` and
+    QA) while keeping them selectable by name.
+
+  * **`umbrellas`** — a `Dict` mapping an umbrella key to a list of member group
+    keys. When `GROUP` equals the umbrella key, every member runs in order. Members
+    may name `groups` entries or the reserved `"Core"`/`"QA"` bodies; an umbrella key
+    wins over an identically named `groups` entry.
+
+```julia
+# complex monorepo root test/runtests.jl
+using SciMLTesting
+run_tests(;
+    core = joinpath(@__DIR__, "core_tests.jl"),
+    groups = Dict(
+        "InterfaceI"  => joinpath(@__DIR__, "interface_i.jl"),
+        "InterfaceII" => joinpath(@__DIR__, "interface_ii.jl"),
+        "Regression_I"  => joinpath(@__DIR__, "regression_i.jl"),
+        "Regression_II" => joinpath(@__DIR__, "regression_ii.jl"),
+        "AlgConvergence_I" => joinpath(@__DIR__, "alg_i.jl"),  # excluded from "All"
+    ),
+    qa = (; env = joinpath(@__DIR__, "qa"), body = joinpath(@__DIR__, "qa", "qa.jl")),
+
+    # "All" runs exactly these (Core + interfaces + regressions); QA and
+    # AlgConvergence_* are excluded but remain selectable by name.
+    all = ["Core", "InterfaceI", "InterfaceII", "Regression_I", "Regression_II"],
+
+    # GROUP=Interface runs all five interface groups; GROUP=Regression runs both.
+    umbrellas = Dict(
+        "Interface"  => ["InterfaceI", "InterfaceII"],
+        "Regression" => ["Regression_I", "Regression_II"],
+    ),
+
+    # Root reads GROUP; sublibraries read ODEDIFFEQ_TEST_GROUP.
+    sublib_env = "ODEDIFFEQ_TEST_GROUP",
     lib_dir = joinpath(@__DIR__, "..", "lib"),
 )
 ```

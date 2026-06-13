@@ -385,7 +385,8 @@ end
 
 """
     run_tests(; core, groups = Dict(), qa = nothing,
-              env = "GROUP", default = "All",
+              env = "GROUP", default = "All", sublib_env = env,
+              all = nothing, umbrellas = Dict(),
               lib_dir = nothing, parent = nothing, pkg = nothing)
 
 Declarative top-level dispatcher for a SciML `test/runtests.jl`. It owns the whole
@@ -402,15 +403,40 @@ group-routing control flow, so a repo replaces its hand-written `if GROUP == "Al
     of the form `(; body = ..., env = "subdir", parent = ...)` to activate a
     per-group sub-env (via [`activate_group_env`](@ref), which includes the
     [`develop_sources!`](@ref) `[sources]` backport) before running `body`. Groups
-    that declare no `env` are treated as in-process and are *also* run as part of
-    `"All"`.
-  * `qa` — the QA group body, run for the `"QA"` group (and as part of `"All"`).
-    Accepts the same shapes as a `groups` value. A convenient form is a
+    that declare no `env` are treated as in-process and are (by default) *also* run
+    as part of `"All"`; see `all` to curate this.
+  * `qa` — the QA group body, run for the `"QA"` group (and, by default, as part of
+    `"All"`). Accepts the same shapes as a `groups` value. A convenient form is a
     `NamedTuple`/`Dict` carrying the package and Aqua/JET handles plus a thunk that
     calls [`run_qa`](@ref), e.g. `qa = (; env = "qa", body = () -> run_qa(MyPkg;
     Aqua = Aqua))`.
   * `env`, `default` — forwarded to [`current_group`](@ref) to read and normalize
-    the selected group (empty string and unset both normalize to `default`).
+    the selected group (empty string and unset both normalize to `default`). `env`
+    is the variable the *root* dispatcher reads to learn which group was requested.
+  * `sublib_env` — the environment variable name to hand the sub-group off to when
+    routing to a sublibrary, defaulting to `env`. A monorepo whose root reads one
+    variable (e.g. `GROUP`) but whose sublibraries read a *different* variable (e.g.
+    `ODEDIFFEQ_TEST_GROUP`) sets `sublib_env` to the latter: the root still reads
+    `env` to pick the sublibrary, but the `Pkg.test` of that sublibrary runs with
+    `ENV[sublib_env]` (not `ENV[env]`) set to the sub-group. When the root and
+    sublibraries share a variable (the common case) leave `sublib_env` unset.
+  * `all` — curate exactly which groups `"All"` runs, instead of the default
+    "`core` + every in-process (no-`env`) group + `qa`". Pass a list of group keys
+    (e.g. `["Core", "InterfaceI", "InterfaceII", "Regression_II"]`); `"All"` then
+    runs exactly those keys, in the order given, resolved against
+    `groups`/`"Core"`/`"QA"`. The root `core` body runs under `"All"` **only if**
+    `"Core"` appears in the list, and `qa` runs **only if** `"QA"` appears — so a
+    repo can exclude `qa` (and any heavy/environment-specific group) from `"All"`
+    simply by leaving it out of the list, while those groups remain selectable by
+    name. A listed key runs even if it declares a sub-`env`. When `all === nothing`
+    (the default), the legacy behavior is kept (`core` + every in-process group +
+    `qa`).
+  * `umbrellas` — a `Dict`/`NamedTuple` mapping an umbrella group key to a list of
+    member group keys (e.g. `Dict("Interface" => ["InterfaceI", "InterfaceII"])`).
+    When `GROUP` equals an umbrella key, every member group is run (in the listed
+    order), as though each had been requested in turn. Members may name `groups`
+    entries or the reserved `"Core"`/`"QA"` bodies. An umbrella key takes precedence
+    over an identically named `groups` entry.
   * `lib_dir` — for a monorepo, the directory holding `lib/<Sublibrary>`
     sub-packages. When given, a `GROUP` naming a sublibrary activates that
     sublibrary and `Pkg.test`s it (see Routing).
@@ -423,17 +449,20 @@ group-routing control flow, so a repo replaces its hand-written `if GROUP == "Al
 
 Let `group = current_group(; env, default)`:
 
-  * `"All"` — run `core`, then every `groups` entry that declares no sub-`env`
-    (in-process groups), then `qa`.
+  * `"All"` — when `all === nothing`, run `core`, then every `groups` entry that
+    declares no sub-`env` (in-process groups), then `qa`. When `all` is a list, run
+    exactly the listed keys (resolved against `groups`/`"Core"`/`"QA"`), in order —
+    so `core` runs only if `"Core"` is listed and `qa` only if `"QA"` is listed.
+  * an umbrella key (a key of `umbrellas`) — run each member group in turn.
   * `"Core"` — run `core`.
   * `"QA"` — run `qa` (errors if `qa === nothing`).
   * a key of `groups` — run that group (activating its sub-`env` first if declared).
   * otherwise, if `lib_dir` is given and `group` resolves to a sublibrary via
     [`detect_sublibrary_group`](@ref) — `Pkg.activate` `lib/<sublib>` and
-    `Pkg.test` it with the sub-group exported as `ENV[env]`. The empty group and the
-    reserved names `"All"`/`"Core"`/`"QA"` are **never** treated as sublibraries
-    even though `isdir(joinpath(lib_dir, ""))` is `true`; they fall through to
-    `core`/`qa` above.
+    `Pkg.test` it with the sub-group exported as `ENV[sublib_env]`. The empty group
+    and the reserved names `"All"`/`"Core"`/`"QA"` are **never** treated as
+    sublibraries even though `isdir(joinpath(lib_dir, ""))` is `true`; they fall
+    through to `core`/`qa` above.
   * otherwise — fall through to `core` (an unknown group runs the default body).
 
 # `using Test` is guaranteed
@@ -469,6 +498,27 @@ run_tests(;
     core = joinpath(@__DIR__, "core_tests.jl"),
     lib_dir = joinpath(@__DIR__, "..", "lib"),
 )
+
+# monorepo root whose sublibraries read a different env var, with a curated "All"
+# (excluding the AlgConvergence_* groups and QA) and umbrella groups:
+run_tests(;
+    core = joinpath(@__DIR__, "core_tests.jl"),
+    groups = Dict(
+        "InterfaceI"  => joinpath(@__DIR__, "interface_i.jl"),
+        "InterfaceII" => joinpath(@__DIR__, "interface_ii.jl"),
+        "Regression_I"  => joinpath(@__DIR__, "regression_i.jl"),
+        "Regression_II" => joinpath(@__DIR__, "regression_ii.jl"),
+        "AlgConvergence_I" => joinpath(@__DIR__, "alg_i.jl"),
+    ),
+    qa = (; env = "qa", body = joinpath(@__DIR__, "qa", "qa.jl")),
+    all = ["InterfaceI", "InterfaceII", "Regression_I", "Regression_II"],
+    umbrellas = Dict(
+        "Interface"  => ["InterfaceI", "InterfaceII"],
+        "Regression" => ["Regression_I", "Regression_II"],
+    ),
+    sublib_env = "ODEDIFFEQ_TEST_GROUP",
+    lib_dir = joinpath(@__DIR__, "..", "lib"),
+)
 ```
 """
 function run_tests(;
@@ -477,21 +527,39 @@ function run_tests(;
         qa = nothing,
         env::AbstractString = "GROUP",
         default::AbstractString = "All",
+        sublib_env::AbstractString = env,
+        all = nothing,
+        umbrellas = Dict{String, Any}(),
         lib_dir = nothing,
         parent = nothing,
         pkg = nothing,
     )
     group = current_group(; env = env, default = default)
     group_table = _as_string_dict(groups)
+    umbrella_table = _as_string_dict(umbrellas)
 
     if group == "All"
-        _run_group_spec(_group_spec(core), parent)
-        # In-process functional groups (no declared sub-env) also run under "All".
-        for name in sort!(collect(keys(group_table)))
-            spec = _group_spec(group_table[name])
-            spec.env === nothing && _run_body(spec.body)
+        if all === nothing
+            # Legacy default: core, then every in-process functional group, then qa.
+            _run_group_spec(_group_spec(core), parent)
+            for name in sort!(collect(keys(group_table)))
+                spec = _group_spec(group_table[name])
+                spec.env === nothing && _run_body(spec.body)
+            end
+            qa === nothing || _run_group_spec(_group_spec(qa), parent)
+        else
+            # Curated "All": run exactly the listed keys, in order. `core` runs only
+            # if "Core" is listed; `qa` only if "QA" is listed.
+            for name in all
+                _run_named_group(string(name), core, group_table, qa, parent)
+            end
         end
-        qa === nothing || _run_group_spec(_group_spec(qa), parent)
+        return nothing
+    elseif haskey(umbrella_table, group)
+        # An umbrella key expands to its member groups, each run in turn.
+        for member in _as_string_list(umbrella_table[group])
+            _run_named_group(member, core, group_table, qa, parent)
+        end
         return nothing
     elseif group == "Core"
         _run_group_spec(_group_spec(core), parent)
@@ -514,7 +582,7 @@ function run_tests(;
         if !isempty(sublib) && isdir(joinpath(lib_dir, sublib))
             Pkg.activate(joinpath(lib_dir, sublib))
             test_target = pkg === nothing ? sublib : pkg
-            withenv(env => subgroup) do
+            withenv(sublib_env => subgroup) do
                 Pkg.test(test_target; allow_reresolve = true)
             end
             return nothing
@@ -525,6 +593,27 @@ function run_tests(;
     _run_group_spec(_group_spec(core), parent)
     return nothing
 end
+
+# Run a named group key against the `groups` table, resolving the reserved
+# "Core"/"QA" keys to the `core`/`qa` bodies. Used by curated-"All" and umbrella
+# expansion so a listed key behaves exactly as if it had been requested via GROUP.
+function _run_named_group(key::AbstractString, core, group_table, qa, parent)
+    if key == "Core"
+        _run_group_spec(_group_spec(core), parent)
+    elseif key == "QA"
+        qa === nothing &&
+            throw(ArgumentError("run_tests: \"QA\" was listed in `all`/`umbrellas` but no `qa` body was provided"))
+        _run_group_spec(_group_spec(qa), parent)
+    elseif haskey(group_table, key)
+        _run_group_spec(_group_spec(group_table[key]), parent)
+    else
+        throw(ArgumentError("run_tests: \"$key\" was listed in `all`/`umbrellas` but is not a key of `groups` (nor the reserved \"Core\"/\"QA\")"))
+    end
+    return nothing
+end
+
+_as_string_list(x::AbstractString) = [x]
+_as_string_list(xs) = [string(x) for x in xs]
 
 # Activate a group spec's sub-env (if it declares one) and run its body.
 function _run_group_spec(spec::GroupSpec, default_parent)

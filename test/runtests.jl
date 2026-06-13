@@ -343,6 +343,215 @@ end
         @test isfile(marker)
     end
 
+    @testset "run_tests sublib_env handoff (distinct read/handoff vars)" begin
+        # Extension 1: a monorepo whose root reads one variable (`GROUP`) but whose
+        # sublibraries read a *different* one (`ODEDIFFEQ_TEST_GROUP`). The root must
+        # pick the sublibrary off `env` and hand the sub-group off via `sublib_env`,
+        # NOT via `env`. We exercise this without a real nested Pkg.test by building a
+        # fake sublibrary package whose own runtests records which env vars it saw.
+        root = mktempdir()
+        lib = joinpath(root, "lib")
+        sub = joinpath(lib, "MySub")
+        mkpath(joinpath(sub, "src"))
+        write(
+            joinpath(sub, "Project.toml"),
+            """
+            name = "MySub"
+            uuid = "22222222-2222-2222-2222-222222222222"
+            version = "0.1.0"
+
+            [extras]
+            Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+            [targets]
+            test = ["Test"]
+            """,
+        )
+        write(joinpath(sub, "src", "MySub.jl"), "module MySub\nend\n")
+        # The sublibrary's runtests records the read var (handoff) and the root var,
+        # so the assertion can prove the handoff arrived on `sublib_env`, not `env`.
+        seen = joinpath(root, "seen.txt")
+        mkpath(joinpath(sub, "test"))
+        write(
+            joinpath(sub, "test", "runtests.jl"),
+            """
+            handoff = get(ENV, "SUB_TEST_GROUP", "<unset>")
+            rootvar = get(ENV, "GROUP", "<unset>")
+            open(raw"$(seen)", "w") do io
+                println(io, "handoff=", handoff)
+                println(io, "rootvar=", rootvar)
+            end
+            """,
+        )
+
+        original_project = Base.active_project()
+        try
+            # Root reads GROUP="MySub_Special"; sublib must receive Special on
+            # SUB_TEST_GROUP. GROUP itself is left at the root value during the
+            # sublibrary Pkg.test, so the sublibrary reading GROUP would see the
+            # *wrong* (root) value — proving the handoff must use sublib_env.
+            withenv("GROUP" => "MySub_Special", "SUB_TEST_GROUP" => nothing) do
+                run_tests(;
+                    core = () -> nothing,
+                    lib_dir = lib,
+                    sublib_env = "SUB_TEST_GROUP",
+                )
+            end
+            contents = read(seen, String)
+            @test occursin("handoff=Special", contents)
+            # The root var, if the sublibrary had (wrongly) read it for its group,
+            # carries the full unstripped root value — definitely not "Special".
+            @test occursin("rootvar=MySub_Special", contents)
+            @test !occursin("handoff=MySub_Special", contents)
+        finally
+            Pkg.activate(original_project)
+        end
+    end
+
+    @testset "run_tests curated `all` (excludes a group and QA)" begin
+        # Extension 2: a curated `all` list that runs Core + a chosen subset, while
+        # EXCLUDING both a registered functional group (Heavy) and QA. The excluded
+        # groups must NOT run under "All" but MUST still run when selected by name.
+        root = mktempdir()
+        marker(name) = joinpath(root, "ran_$(name)")
+        ran(name) = isfile(marker(name))
+        clear!() = foreach(["core", "light", "heavy", "qa"]) do n
+            isfile(marker(n)) && rm(marker(n))
+        end
+        bodyfile(name) = begin
+            p = joinpath(root, "$(name).jl")
+            write(
+                p,
+                "@testset \"$(name)\" begin\n    @test true\nend\nwrite(\"$(marker(name))\", \"1\")\n",
+            )
+            p
+        end
+        core = bodyfile("core")
+        light = bodyfile("light")
+        heavy = bodyfile("heavy")
+        qa = bodyfile("qa")
+        groups = Dict("Light" => light, "Heavy" => heavy)
+
+        # Curated "All": Core + Light only. Heavy and QA are excluded.
+        clear!()
+        withenv("GROUP" => "All") do
+            run_tests(;
+                core = core, groups = groups, qa = qa,
+                all = ["Core", "Light"]
+            )
+        end
+        @test ran("core") && ran("light")
+        @test !ran("heavy") && !ran("qa")
+
+        # The excluded group is still selectable by name.
+        clear!()
+        withenv("GROUP" => "Heavy") do
+            run_tests(;
+                core = core, groups = groups, qa = qa,
+                all = ["Core", "Light"]
+            )
+        end
+        @test ran("heavy") && !ran("core") && !ran("light") && !ran("qa")
+
+        # QA, excluded from "All", is still selectable by name.
+        clear!()
+        withenv("GROUP" => "QA") do
+            run_tests(;
+                core = core, groups = groups, qa = qa,
+                all = ["Core", "Light"]
+            )
+        end
+        @test ran("qa") && !ran("core") && !ran("light") && !ran("heavy")
+
+        # A curated list omitting "Core" does NOT run core under "All".
+        clear!()
+        withenv("GROUP" => "All") do
+            run_tests(;
+                core = core, groups = groups, qa = qa,
+                all = ["Light"]
+            )
+        end
+        @test ran("light") && !ran("core") && !ran("heavy") && !ran("qa")
+
+        # A curated list naming an unknown key errors.
+        withenv("GROUP" => "All") do
+            @test_throws ArgumentError run_tests(;
+                core = core, groups = groups,
+                qa = qa, all = ["Core", "Nonexistent"]
+            )
+        end
+    end
+
+    @testset "run_tests umbrella groups" begin
+        # Extension 3: an umbrella key expands to >= 2 member groups, each run in
+        # turn. Selecting the umbrella runs all members; selecting a member alone
+        # runs just it. Members may include the reserved "Core"/"QA" bodies.
+        root = mktempdir()
+        marker(name) = joinpath(root, "ran_$(name)")
+        ran(name) = isfile(marker(name))
+        clear!() = foreach(["core", "i1", "i2", "i3", "qa"]) do n
+            isfile(marker(n)) && rm(marker(n))
+        end
+        bodyfile(name) = begin
+            p = joinpath(root, "$(name).jl")
+            write(
+                p,
+                "@testset \"$(name)\" begin\n    @test true\nend\nwrite(\"$(marker(name))\", \"1\")\n",
+            )
+            p
+        end
+        core = bodyfile("core")
+        i1 = bodyfile("i1")
+        i2 = bodyfile("i2")
+        i3 = bodyfile("i3")
+        qa = bodyfile("qa")
+        groups = Dict("InterfaceI" => i1, "InterfaceII" => i2, "InterfaceIII" => i3)
+        umbrellas = Dict("Interface" => ["InterfaceI", "InterfaceII", "InterfaceIII"])
+
+        # The umbrella runs all three members and nothing else.
+        clear!()
+        withenv("GROUP" => "Interface") do
+            run_tests(; core = core, groups = groups, qa = qa, umbrellas = umbrellas)
+        end
+        @test ran("i1") && ran("i2") && ran("i3")
+        @test !ran("core") && !ran("qa")
+
+        # A member is still selectable on its own.
+        clear!()
+        withenv("GROUP" => "InterfaceII") do
+            run_tests(; core = core, groups = groups, qa = qa, umbrellas = umbrellas)
+        end
+        @test ran("i2") && !ran("i1") && !ran("i3") && !ran("core")
+
+        # An umbrella whose members include reserved Core/QA bodies.
+        clear!()
+        umb2 = Dict("Bundle" => ["Core", "InterfaceI", "QA"])
+        withenv("GROUP" => "Bundle") do
+            run_tests(; core = core, groups = groups, qa = qa, umbrellas = umb2)
+        end
+        @test ran("core") && ran("i1") && ran("qa") && !ran("i2") && !ran("i3")
+
+        # An umbrella member that is not a known group errors.
+        clear!()
+        withenv("GROUP" => "Bad") do
+            @test_throws ArgumentError run_tests(;
+                core = core, groups = groups,
+                umbrellas = Dict("Bad" => ["InterfaceI", "Ghost"])
+            )
+        end
+
+        # An umbrella key takes precedence over an identically named groups entry.
+        clear!()
+        groups_clash = Dict("Interface" => i3, "InterfaceI" => i1, "InterfaceII" => i2)
+        withenv("GROUP" => "Interface") do
+            run_tests(;
+                core = core, groups = groups_clash, qa = qa,
+                umbrellas = Dict("Interface" => ["InterfaceI", "InterfaceII"])
+            )
+        end
+        @test ran("i1") && ran("i2") && !ran("i3")
+    end
+
     @testset "run_tests sublibrary empty-group guard" begin
         # Regression (Corleone bug): with a lib/ dir present, an empty/unset GROUP
         # must route to core, NOT be misdetected as a sublibrary because
