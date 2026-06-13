@@ -18,29 +18,40 @@ and Corleone.jl) repeat the same boilerplate in every `test/runtests.jl` and eve
 
 This package factors those pieces into documented helpers so each repo's
 `runtests.jl` becomes `using SciMLTesting` plus a few calls instead of copy-pasted
-setup. It deliberately depends only on the standard libraries `Pkg`, `TOML`, and
-`Test`; the QA helper accepts the already-loaded `Aqua`/`JET` modules as keyword
-arguments so that those heavier tools stay in each repo's `test/qa/Project.toml`
-and never enter `SciMLTesting`'s own dependency graph.
+setup. The top-level [`run_tests`](@ref) dispatcher owns the whole `runtests.jl`
+control flow, so a repo replaces its hand-written `if GROUP == ...` ladder with a
+single declarative call.
+
+It deliberately depends only on the standard libraries `Pkg`, `TOML`, and `Test`;
+the QA helper accepts the already-loaded `Aqua`/`JET` modules as keyword arguments
+so that those heavier tools stay in each repo's `test/qa/Project.toml` and never
+enter `SciMLTesting`'s own dependency graph.
 """
 module SciMLTesting
 
 using Pkg: Pkg
 using TOML: TOML
-using Test: @testset, @test
+using Test: Test, @testset, @test
 
-export current_group, activate_group_env, run_qa, detect_sublibrary_group
+export current_group, activate_group_env, run_qa, detect_sublibrary_group,
+    develop_sources!, run_tests
+
+# Group names that are never sublibraries and never named functional groups: the
+# routing keywords `run_tests` and `detect_sublibrary_group` reserve.
+const RESERVED_GROUPS = ("All", "Core", "QA")
 
 """
     current_group(; env = "GROUP", default = "All")
 
 Return the requested test group, read from the environment variable named `env`
 (default `"GROUP"`), falling back to `default` (default `"All"`) when that
-variable is unset.
+variable is unset *or set to the empty string*.
 
 This replaces the `const GROUP = get(ENV, "GROUP", "All")` line copied into every
 SciML `test/runtests.jl`. SciML group names are capitalized (`All`, `Core`, `QA`,
-...); the value is returned verbatim with no case normalization.
+...); a non-empty value is returned verbatim with no case normalization. An empty
+`ENV[env]` (which some CI setups produce for an unselected matrix entry) is treated
+the same as unset and yields `default`.
 
 # Examples
 
@@ -51,12 +62,104 @@ const SUBGROUP = current_group(env = "ODE_TEST_GROUP", default = "Core")
 ```
 """
 function current_group(; env::AbstractString = "GROUP", default::AbstractString = "All")
-    return get(ENV, env, default)
+    value = get(ENV, env, default)
+    return isempty(value) ? default : value
+end
+
+"""
+    develop_sources!(group_dir; parent = dirname(group_dir))
+
+On Julia < 1.11, `Pkg.develop` every path dependency declared in the `[sources]`
+table of the environment at `group_dir`, recursively following each developed
+dependency's own `[sources]`. On Julia >= 1.11 this is a no-op.
+
+Julia 1.11 added native support for the `[sources]` table in a `Project.toml`: when
+the environment is instantiated, listed `path =`/`url =` sources are used directly.
+Julia 1.10 (the SciML LTS) ignores `[sources]` entirely, so a monorepo group env
+that relies on `[sources]` to pin its in-repo siblings resolves them as registered
+releases instead of the local PR-branch code. This helper reproduces 1.11's
+behavior on 1.10 by walking the `[sources]` graph and `Pkg.develop`-ing each `path`
+entry.
+
+`group_dir` is the directory holding the env's `Project.toml`. Each `[sources]`
+`path` is resolved relative to the directory of the `Project.toml` that declares it
+(so the walk is correct even as it recurses into siblings). `parent` is accepted
+for symmetry with [`activate_group_env`](@ref) but is unused here — the set of paths
+to develop comes entirely from the `[sources]` graph. The active project is assumed
+to already be `group_dir` (call after `Pkg.activate(group_dir)`); this function does
+not change the active project.
+
+Only `path` sources are developed; `url`/`rev` git sources are left to `Pkg` (a git
+source resolves identically on 1.10 and 1.11, so it needs no backport). Cycles and
+diamonds in the `[sources]` graph are handled by visiting each resolved path once.
+
+# Examples
+
+```julia
+# Julia <1.11: develop the in-repo siblings that test/Foo/Project.toml's
+# [sources] table points at, plus anything *their* [sources] point at.
+Pkg.activate(joinpath(@__DIR__, "Foo"))
+develop_sources!(joinpath(@__DIR__, "Foo"))
+Pkg.instantiate()
+```
+"""
+function develop_sources!(group_dir::AbstractString; parent = dirname(group_dir))
+    # Julia >= 1.11 honors [sources] natively; nothing to backport.
+    VERSION >= v"1.11" && return nothing
+
+    paths = _collect_source_paths(group_dir)
+    isempty(paths) || Pkg.develop([Pkg.PackageSpec(path = p) for p in paths])
+    return nothing
+end
+
+# Walk the `[sources]` graph starting at `group_dir`, returning the ordered list of
+# absolute `path` sources to develop. Each `path` is resolved relative to the
+# directory of the `Project.toml` that declares it, and the walk recurses into each
+# developed dependency's own `[sources]`. Visiting each resolved path once handles
+# cycles and diamonds. This is version-independent (no `VERSION` gate) so the
+# resolution/recursion logic is unit-testable regardless of the running Julia.
+function _collect_source_paths(group_dir::AbstractString)
+    visited = Set{String}()
+    paths = String[]
+    _walk_sources!(paths, visited, abspath(group_dir))
+    return paths
+end
+
+function _walk_sources!(paths::Vector{String}, visited::Set{String}, project_dir::AbstractString)
+    project_file = _project_file(project_dir)
+    project_file === nothing && return nothing
+    parsed = TOML.parsefile(project_file)
+    sources = get(parsed, "sources", nothing)
+    sources isa AbstractDict || return nothing
+    env_dir = dirname(project_file)
+    for (_name, spec) in sources
+        spec isa AbstractDict || continue
+        haskey(spec, "path") || continue       # leave url/rev git sources to Pkg
+        resolved = abspath(joinpath(env_dir, spec["path"]))
+        resolved in visited && continue
+        push!(visited, resolved)
+        push!(paths, resolved)
+        _walk_sources!(paths, visited, resolved)   # recurse into the dep's own [sources]
+    end
+    return nothing
+end
+
+# Locate the Project.toml (or JuliaProject.toml) for an env directory, or return
+# the path itself if it already points at a project file.
+function _project_file(dir::AbstractString)
+    if isfile(dir) && (basename(dir) == "Project.toml" || basename(dir) == "JuliaProject.toml")
+        return dir
+    end
+    for name in ("Project.toml", "JuliaProject.toml")
+        candidate = joinpath(dir, name)
+        isfile(candidate) && return candidate
+    end
+    return nothing
 end
 
 """
     activate_group_env(group_dir; parent = dirname(dirname(abspath(group_dir))),
-                        develop = true, instantiate = true)
+                        develop = true, instantiate = true, develop_sources = true)
 
 Activate the per-group test environment at `group_dir` and prepare it for testing
 the in-repo package.
@@ -67,8 +170,11 @@ the in-repo package.
   1. `Pkg.activate(group_dir)`,
   2. when `develop` is `true`, `Pkg.develop` each path in `parent` so the
      activated environment uses the local (PR-branch) source of the package under
-     test instead of a registered release, and
-  3. when `instantiate` is `true`, `Pkg.instantiate()`.
+     test instead of a registered release,
+  3. when `develop_sources` is `true`, [`develop_sources!`](@ref) the env's
+     `[sources]` graph (a no-op on Julia >= 1.11, the 1.10 `[sources]` backport),
+     and
+  4. when `instantiate` is `true`, `Pkg.instantiate()`.
 
 `parent` may be a single path or an iterable of paths (a monorepo sublibrary group
 typically develops both the sublibrary and the monorepo root). It defaults to the
@@ -97,6 +203,7 @@ function activate_group_env(
         parent = dirname(dirname(abspath(group_dir))),
         develop::Bool = true,
         instantiate::Bool = true,
+        develop_sources::Bool = true,
     )
     Pkg.activate(group_dir)
     if develop
@@ -104,6 +211,7 @@ function activate_group_env(
         specs = [Pkg.PackageSpec(path = abspath(p)) for p in parents]
         isempty(specs) || Pkg.develop(specs)
     end
+    develop_sources && develop_sources!(group_dir; parent = parent)
     instantiate && Pkg.instantiate()
     return nothing
 end
@@ -183,6 +291,12 @@ prefix wins (sublibrary names themselves may contain underscores). If no
 sublibrary directory matches, `(group, default_group)` is returned so the caller
 can fall through to its root-package dispatch.
 
+An empty `group` is never treated as a sublibrary even though
+`isdir(joinpath(lib_dir, ""))` is true: it returns `("", default_group)` so the
+caller falls through to its root dispatch. (Guarding this case is the
+responsibility of the caller via `isdir(joinpath(lib_dir, sublibrary)) &&
+!isempty(sublibrary)`; [`run_tests`](@ref) does exactly that.)
+
 This replaces the `_detect_sublibrary_group` closure copied into the root
 `test/runtests.jl` of each SciML monorepo. Use `isdir(joinpath(lib_dir, sublib))`
 on the returned `sublibrary` to decide whether to route to a sublibrary.
@@ -192,7 +306,7 @@ on the returned `sublibrary` to decide whether to route to a sublibrary.
 ```julia
 lib_dir = joinpath(@__DIR__, "..", "lib")
 sublib, grp = detect_sublibrary_group(current_group(), lib_dir)
-if isdir(joinpath(lib_dir, sublib))
+if !isempty(sublib) && isdir(joinpath(lib_dir, sublib))
     Pkg.activate(joinpath(lib_dir, sublib))
     withenv("MYPKG_TEST_GROUP" => grp) do
         Pkg.test(sublib; allow_reresolve = true)
@@ -207,6 +321,9 @@ function detect_sublibrary_group(
         lib_dir::AbstractString;
         default_group::AbstractString = "Core",
     )
+    # An empty group must never match a sublibrary even though
+    # `joinpath(lib_dir, "")` is a directory: fall through to root dispatch.
+    isempty(group) && return (group, default_group)
     isdir(joinpath(lib_dir, group)) && return (group, default_group)
     for i in lastindex(group):-1:firstindex(group)
         if group[i] == '_' && isdir(joinpath(lib_dir, group[firstindex(group):prevind(group, i)]))
@@ -215,5 +332,212 @@ function detect_sublibrary_group(
     end
     return (group, default_group)
 end
+
+# A group's "body" is either a file path to `include`, or a 0-argument thunk to
+# call. A group entry may also be a NamedTuple/Dict carrying both the body and a
+# sub-env dir to activate; this normalizes any of those to (body, env, parent).
+struct GroupSpec
+    body::Any            # AbstractString (file path) or callable thunk
+    env::Any             # nothing, or a directory to activate_group_env
+    parent::Any          # nothing, or parent override for activate_group_env
+end
+
+function _group_spec(entry)
+    if entry isa GroupSpec
+        return entry
+    elseif entry isa AbstractString
+        return GroupSpec(entry, nothing, nothing)
+    elseif entry isa NamedTuple || entry isa AbstractDict
+        d = _as_symbol_dict(entry)
+        haskey(d, :body) ||
+            throw(ArgumentError("run_tests: group entry table must have a `body` (file path or thunk) key"))
+        return GroupSpec(d[:body], get(d, :env, nothing), get(d, :parent, nothing))
+    elseif _callable(entry)
+        return GroupSpec(entry, nothing, nothing)
+    else
+        throw(ArgumentError("run_tests: group entry must be a file path, a 0-arg thunk, or a NamedTuple/Dict with a `body` key; got $(typeof(entry))"))
+    end
+end
+
+_callable(x) = x isa Function || !isempty(methods(x))
+_as_symbol_dict(nt::NamedTuple) = Dict{Symbol, Any}(pairs(nt))
+_as_symbol_dict(d::AbstractDict) = Dict{Symbol, Any}(Symbol(k) => v for (k, v) in d)
+
+# Run a group body. A file path is `include`d into a fresh module that has
+# `using Test` in scope, so an included file can use `@testset`/`@test`/`@test_throws`
+# without its own `using Test` (the missing-`using Test` bug class). A thunk is
+# called directly (the caller is responsible for its own scope).
+function _run_body(body)
+    if body isa AbstractString
+        mod = Module(gensym(:SciMLTestingInclude))
+        # Bring Base and Test into the include scope. `using Test` makes the full
+        # Test API (`@testset`, `@test`, `@test_throws`, `@test_broken`, ...)
+        # available to the included file even if it forgot to load Test itself.
+        Core.eval(mod, :(using Base, Test))
+        Base.include(mod, abspath(body))
+    elseif _callable(body)
+        Base.invokelatest(body)
+    else
+        throw(ArgumentError("run_tests: group body must be a file path or a 0-arg thunk; got $(typeof(body))"))
+    end
+    return nothing
+end
+
+"""
+    run_tests(; core, groups = Dict(), qa = nothing,
+              env = "GROUP", default = "All",
+              lib_dir = nothing, parent = nothing, pkg = nothing)
+
+Declarative top-level dispatcher for a SciML `test/runtests.jl`. It owns the whole
+group-routing control flow, so a repo replaces its hand-written `if GROUP == "All"
+... elseif GROUP == "QA" ...` ladder with a single call.
+
+# Arguments
+
+  * `core` — the Core / default test body: a file path to `include` (e.g.
+    `joinpath(@__DIR__, "core_tests.jl")`) or a 0-argument thunk. Run for the
+    `"All"` and `"Core"` groups.
+  * `groups` — a `Dict`/`NamedTuple` mapping a `GROUP` name to that functional
+    group's body. Each value is a file path, a 0-arg thunk, or a `NamedTuple`/`Dict`
+    of the form `(; body = ..., env = "subdir", parent = ...)` to activate a
+    per-group sub-env (via [`activate_group_env`](@ref), which includes the
+    [`develop_sources!`](@ref) `[sources]` backport) before running `body`. Groups
+    that declare no `env` are treated as in-process and are *also* run as part of
+    `"All"`.
+  * `qa` — the QA group body, run for the `"QA"` group (and as part of `"All"`).
+    Accepts the same shapes as a `groups` value. A convenient form is a
+    `NamedTuple`/`Dict` carrying the package and Aqua/JET handles plus a thunk that
+    calls [`run_qa`](@ref), e.g. `qa = (; env = "qa", body = () -> run_qa(MyPkg;
+    Aqua = Aqua))`.
+  * `env`, `default` — forwarded to [`current_group`](@ref) to read and normalize
+    the selected group (empty string and unset both normalize to `default`).
+  * `lib_dir` — for a monorepo, the directory holding `lib/<Sublibrary>`
+    sub-packages. When given, a `GROUP` naming a sublibrary activates that
+    sublibrary and `Pkg.test`s it (see Routing).
+  * `parent` — default `parent` forwarded to [`activate_group_env`](@ref) for any
+    group that declares an `env` but no `parent` of its own.
+  * `pkg` — optional package name/`PackageSpec` to `Pkg.test` for a matched
+    sublibrary; defaults to the sublibrary name.
+
+# Routing
+
+Let `group = current_group(; env, default)`:
+
+  * `"All"` — run `core`, then every `groups` entry that declares no sub-`env`
+    (in-process groups), then `qa`.
+  * `"Core"` — run `core`.
+  * `"QA"` — run `qa` (errors if `qa === nothing`).
+  * a key of `groups` — run that group (activating its sub-`env` first if declared).
+  * otherwise, if `lib_dir` is given and `group` resolves to a sublibrary via
+    [`detect_sublibrary_group`](@ref) — `Pkg.activate` `lib/<sublib>` and
+    `Pkg.test` it with the sub-group exported as `ENV[env]`. The empty group and the
+    reserved names `"All"`/`"Core"`/`"QA"` are **never** treated as sublibraries
+    even though `isdir(joinpath(lib_dir, ""))` is `true`; they fall through to
+    `core`/`qa` above.
+  * otherwise — fall through to `core` (an unknown group runs the default body).
+
+# `using Test` is guaranteed
+
+File-path bodies are `include`d into a fresh module that has `using Test` in scope,
+so an included file can use `@testset`/`@test` without its own `using Test`. (A
+missing `using Test` in an included file was a recurring source of breakage.)
+
+# No `Pkg` needed in the repo's `[extras]`
+
+Because `SciMLTesting` bundles `Pkg` and does every `Pkg.activate`/`develop`/
+`instantiate`/`test` internally, a repo converted to `run_tests` no longer needs
+`Pkg` in its own `[extras]`/`test` target — only `SciMLTesting` (and whatever the
+test bodies themselves load, e.g. `Aqua`/`JET` in the QA sub-env). This removes the
+`Pkg`-in-`[extras]` dependency-compat nit.
+
+# Examples
+
+```julia
+# single package: test/runtests.jl
+using SciMLTesting
+run_tests(;
+    core = joinpath(@__DIR__, "core_tests.jl"),
+    qa = (; env = "qa", body = () -> begin
+        using MyPackage, Aqua
+        run_qa(MyPackage; Aqua = Aqua)
+    end),
+)
+
+# monorepo root: test/runtests.jl
+using SciMLTesting
+run_tests(;
+    core = joinpath(@__DIR__, "core_tests.jl"),
+    lib_dir = joinpath(@__DIR__, "..", "lib"),
+)
+```
+"""
+function run_tests(;
+        core,
+        groups = Dict{String, Any}(),
+        qa = nothing,
+        env::AbstractString = "GROUP",
+        default::AbstractString = "All",
+        lib_dir = nothing,
+        parent = nothing,
+        pkg = nothing,
+    )
+    group = current_group(; env = env, default = default)
+    group_table = _as_string_dict(groups)
+
+    if group == "All"
+        _run_group_spec(_group_spec(core), parent)
+        # In-process functional groups (no declared sub-env) also run under "All".
+        for name in sort!(collect(keys(group_table)))
+            spec = _group_spec(group_table[name])
+            spec.env === nothing && _run_body(spec.body)
+        end
+        qa === nothing || _run_group_spec(_group_spec(qa), parent)
+        return nothing
+    elseif group == "Core"
+        _run_group_spec(_group_spec(core), parent)
+        return nothing
+    elseif group == "QA"
+        qa === nothing &&
+            throw(ArgumentError("run_tests: GROUP=\"QA\" was requested but no `qa` body was provided"))
+        _run_group_spec(_group_spec(qa), parent)
+        return nothing
+    elseif haskey(group_table, group)
+        _run_group_spec(_group_spec(group_table[group]), parent)
+        return nothing
+    end
+
+    # Sublibrary routing (monorepo). Guard against the empty group and the reserved
+    # names being misdetected as a sublibrary: `isdir(joinpath(lib_dir, ""))` is
+    # true, which previously routed an unselected/"All" group to a bogus sublibrary.
+    if lib_dir !== nothing && !isempty(group) && !(group in RESERVED_GROUPS)
+        sublib, subgroup = detect_sublibrary_group(group, lib_dir)
+        if !isempty(sublib) && isdir(joinpath(lib_dir, sublib))
+            Pkg.activate(joinpath(lib_dir, sublib))
+            test_target = pkg === nothing ? sublib : pkg
+            withenv(env => subgroup) do
+                Pkg.test(test_target; allow_reresolve = true)
+            end
+            return nothing
+        end
+    end
+
+    # Unknown group: fall through to the default (core) body.
+    _run_group_spec(_group_spec(core), parent)
+    return nothing
+end
+
+# Activate a group spec's sub-env (if it declares one) and run its body.
+function _run_group_spec(spec::GroupSpec, default_parent)
+    if spec.env !== nothing
+        kwargs = spec.parent !== nothing ? (; parent = spec.parent) :
+            (default_parent !== nothing ? (; parent = default_parent) : (;))
+        activate_group_env(spec.env; kwargs...)
+    end
+    _run_body(spec.body)
+    return nothing
+end
+
+_as_string_dict(d::AbstractDict) = Dict{String, Any}(string(k) => v for (k, v) in d)
+_as_string_dict(nt::NamedTuple) = Dict{String, Any}(string(k) => v for (k, v) in pairs(nt))
 
 end # module SciMLTesting
