@@ -343,6 +343,38 @@ end
         @test isfile(marker)
     end
 
+    @testset "run_tests file body: nested include define-then-call (world age)" begin
+        # Regression (MuladdMacro pattern, InternalJunk#51): a file-path Core body
+        # that, inside a single @testset, defines a function via a nested `include`
+        # of a fixture file and then CALLS that function in the same testset. Under
+        # the old fresh-module `Base.include` (or thunk invokelatest) this raised a
+        # world-age `MethodError` ("method too new to be called from this world
+        # context"); evaluating the body at the Main toplevel (as a hand-written
+        # runtests.jl's `include` does) gives per-statement world-age advancement so
+        # the nested-include-defined method is callable in the same expression.
+        root = mktempdir()
+        marker = joinpath(root, "did_run")
+        # Fixture defining the function, included by the body (mirrors MuladdMacro's
+        # `include(to_muladd, testfile)` defining test_muladd_include).
+        fixture = joinpath(root, "fixture.jl")
+        write(fixture, "wa_defined(a, b, c) = a * b + c\n")
+        body = joinpath(root, "core.jl")
+        # Note: the body deliberately has NO `using Test` of its own, and the
+        # include + call happen inside the SAME @testset (the world-age trap).
+        write(
+            body,
+            "@testset \"nested include define-then-call\" begin\n" *
+                "    include(raw\"$(fixture)\")\n" *
+                "    @test wa_defined(2.0, 3.0, 4.0) == 10.0\n" *
+                "end\n" *
+                "write(raw\"$(marker)\", \"ok\")\n",
+        )
+        withenv("GROUP" => "Core") do
+            run_tests(; core = body)
+        end
+        @test isfile(marker)
+    end
+
     @testset "run_tests sublib_env handoff (distinct read/handoff vars)" begin
         # Extension 1: a monorepo whose root reads one variable (`GROUP`) but whose
         # sublibraries read a *different* one (`ODEDIFFEQ_TEST_GROUP`). The root must

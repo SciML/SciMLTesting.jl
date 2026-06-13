@@ -95,8 +95,15 @@ run_qa(MyPackage; Aqua = Aqua)
 
 Key guarantees:
 
-  * **`using Test` is in scope for every included file.** File-path bodies are
-    `include`d into a fresh module that has `using Test`, so an included file may use
+  * **File-path bodies run at the `Main` toplevel (world-age-safe).** A file-path
+    body is `include`d at the `Main` toplevel, exactly as a hand-written `runtests.jl`
+    does `include("core.jl")` under `Pkg.test`. Each top-level statement gets the
+    normal per-statement world-age advancement, so a file that defines a method via a
+    nested `include(mapexpr, file)` (or plain `include`) and then calls it in the same
+    `@testset` works. (A thunk runs in a single function world and cannot host that
+    define-then-call pattern; use a file path for it.)
+  * **`using Test` is in scope for every included file.** `Test` is brought into
+    `Main` before a file-path body is `include`d, so an included file may use
     `@testset`/`@test`/`@test_throws` without its own `using Test`.
   * **Empty/unset `GROUP` and `"All"` are normalized correctly**, and the empty
     group and reserved names (`All`/`Core`/`QA`) are never misrouted to a

@@ -363,18 +363,30 @@ _callable(x) = x isa Function || !isempty(methods(x))
 _as_symbol_dict(nt::NamedTuple) = Dict{Symbol, Any}(pairs(nt))
 _as_symbol_dict(d::AbstractDict) = Dict{Symbol, Any}(Symbol(k) => v for (k, v) in d)
 
-# Run a group body. A file path is `include`d into a fresh module that has
-# `using Test` in scope, so an included file can use `@testset`/`@test`/`@test_throws`
-# without its own `using Test` (the missing-`using Test` bug class). A thunk is
-# called directly (the caller is responsible for its own scope).
+# Run a group body. A file path is `include`d at the `Main` toplevel, exactly as a
+# hand-written `runtests.jl` does `include("core.jl")` under `Pkg.test`. Running at
+# the `Main` toplevel gives each top-level statement of the included file the normal
+# per-statement world-age advancement, so a file that defines a method via a nested
+# `include(mapexpr, file)` (or plain `include`) and then *calls* that method in the
+# same `@testset`/expression works — under a fresh `Module(gensym())` include it does
+# not, because the new method is "too new to be called from this world context"
+# (world-age `MethodError`). `Test` is brought into `Main` first so an included file
+# can use `@testset`/`@test`/`@test_throws` without its own `using Test` (the
+# missing-`using Test` bug class) — a hand-written runtests.jl's own `using Test`
+# already does this.
+#
+# A thunk runs inside a single function call (`invokelatest`), so its world age does
+# *not* advance mid-body: a thunk cannot host a define-via-nested-`include`-then-call
+# pattern. File-path bodies are therefore the recommended (and world-age-safe) form
+# for `core`/groups; a thunk is fine for bodies that do not define-then-call across a
+# nested `include`.
 function _run_body(body)
     if body isa AbstractString
-        mod = Module(gensym(:SciMLTestingInclude))
-        # Bring Base and Test into the include scope. `using Test` makes the full
-        # Test API (`@testset`, `@test`, `@test_throws`, `@test_broken`, ...)
-        # available to the included file even if it forgot to load Test itself.
-        Core.eval(mod, :(using Base, Test))
-        Base.include(mod, abspath(body))
+        # `using Test` at the `Main` toplevel makes the full Test API (`@testset`,
+        # `@test`, `@test_throws`, `@test_broken`, ...) available to the included
+        # file even if it forgot to load Test itself.
+        Core.eval(Main, :(using Base, Test))
+        Base.include(Main, abspath(body))
     elseif _callable(body)
         Base.invokelatest(body)
     else
@@ -465,11 +477,27 @@ Let `group = current_group(; env, default)`:
     through to `core`/`qa` above.
   * otherwise — fall through to `core` (an unknown group runs the default body).
 
+# File-path bodies run at the `Main` toplevel (world-age-safe)
+
+A file-path body is `include`d at the `Main` toplevel — exactly as a hand-written
+`runtests.jl` does `include("core.jl")` under `Pkg.test`. This gives each top-level
+statement of the file the normal per-statement world-age advancement, so a file that
+defines a method via a nested `include(mapexpr, file)` (or plain `include`) and then
+*calls* that method in the same `@testset`/expression works. (Under the old
+fresh-module include this raised a world-age `MethodError`: "method too new to be
+called from this world context".) For this reason **file-path bodies are the
+recommended form for `core`/groups**.
+
+A thunk body (`() -> ...`) runs inside a single function call, whose world age does
+*not* advance mid-body, so a thunk **cannot** host a define-via-nested-`include`-then-
+call pattern; use a file path for that.
+
 # `using Test` is guaranteed
 
-File-path bodies are `include`d into a fresh module that has `using Test` in scope,
-so an included file can use `@testset`/`@test` without its own `using Test`. (A
-missing `using Test` in an included file was a recurring source of breakage.)
+`Test` is brought into `Main` before a file-path body is `include`d, so an included
+file can use `@testset`/`@test` without its own `using Test`. (A missing `using Test`
+in an included file was a recurring source of breakage; a hand-written runtests.jl's
+own `using Test` already provides this.)
 
 # No `Pkg` needed in the repo's `[extras]`
 
