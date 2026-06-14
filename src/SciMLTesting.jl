@@ -22,16 +22,19 @@ setup. The top-level [`run_tests`](@ref) dispatcher owns the whole `runtests.jl`
 control flow, so a repo replaces its hand-written `if GROUP == ...` ladder with a
 single declarative call.
 
-It deliberately depends only on the standard libraries `Pkg`, `TOML`, and `Test`;
-the QA helper accepts the already-loaded `Aqua`/`JET` modules as keyword arguments
-so that those heavier tools stay in each repo's `test/qa/Project.toml` and never
-enter `SciMLTesting`'s own dependency graph.
+It deliberately stays light, depending only on the standard libraries `Pkg`,
+`TOML`, and `Test` plus the tiny `SafeTestsets` package (whose `@safetestset` macro
+runs each file-path group body in its own isolated module). The QA helper accepts
+the already-loaded `Aqua`/`JET` modules as keyword arguments so that those heavier
+tools stay in each repo's `test/qa/Project.toml` and never enter `SciMLTesting`'s
+own dependency graph.
 """
 module SciMLTesting
 
 using Pkg: Pkg
 using TOML: TOML
 using Test: Test, @testset, @test
+using SafeTestsets: SafeTestsets, @safetestset
 
 export current_group, activate_group_env, run_qa, detect_sublibrary_group,
     develop_sources!, run_tests
@@ -363,30 +366,53 @@ _callable(x) = x isa Function || !isempty(methods(x))
 _as_symbol_dict(nt::NamedTuple) = Dict{Symbol, Any}(pairs(nt))
 _as_symbol_dict(d::AbstractDict) = Dict{Symbol, Any}(Symbol(k) => v for (k, v) in d)
 
-# Run a group body. A file path is `include`d at the `Main` toplevel, exactly as a
-# hand-written `runtests.jl` does `include("core.jl")` under `Pkg.test`. Running at
-# the `Main` toplevel gives each top-level statement of the included file the normal
-# per-statement world-age advancement, so a file that defines a method via a nested
-# `include(mapexpr, file)` (or plain `include`) and then *calls* that method in the
-# same `@testset`/expression works — under a fresh `Module(gensym())` include it does
-# not, because the new method is "too new to be called from this world context"
-# (world-age `MethodError`). `Test` is brought into `Main` first so an included file
-# can use `@testset`/`@test`/`@test_throws` without its own `using Test` (the
-# missing-`using Test` bug class) — a hand-written runtests.jl's own `using Test`
-# already does this.
+# Run a group body. A file path is `include`d inside its own `@safetestset` — a
+# fresh isolated module — exactly as OrdinaryDiffEq.jl's canonical
+# `@safetestset "X" begin include("x.jl") end` structure does. This is the
+# preferred, world-age-safe, isolated form for `core`/groups:
 #
-# A thunk runs inside a single function call (`invokelatest`), so its world age does
-# *not* advance mid-body: a thunk cannot host a define-via-nested-`include`-then-call
-# pattern. File-path bodies are therefore the recommended (and world-age-safe) form
-# for `core`/groups; a thunk is fine for bodies that do not define-then-call across a
-# nested `include`.
-function _run_body(body)
+#   * World-age safe: a module body advances world age per top-level statement, so a
+#     file that defines a method via a nested `include(mapexpr, file)` (or plain
+#     `include`) and then *calls* that method in the same `@testset`/expression
+#     works. Under the old fresh `Module(gensym())` `Base.include` this raised a
+#     world-age `MethodError` ("method too new to be called from this world
+#     context").
+#   * Isolated: each file body runs in its own module, so globals/consts/methods one
+#     group defines are invisible to another group (no cross-group leakage).
+#   * `Test` is in scope automatically: `@safetestset` brings the full Test API
+#     (`@testset`/`@test`/`@test_throws`/...) into the generated module, so an
+#     included file needs no `using Test` of its own (the missing-`using Test` bug
+#     class).
+#
+# The `@safetestset` macro expands to a fresh module that CANNOT see any local
+# variable, so the file path is interpolated as a *literal* into the quoted
+# expression (and `@safetestset`'s own label argument is a string literal). `label`
+# is the group/core name, used for the testset summary.
+#
+# A thunk (`() -> ...`) is invoked as-is via `invokelatest` in the caller's scope —
+# it is NOT isolated and NOT world-age-safe, because a runtime closure cannot be
+# cleanly `@safetestset`-wrapped with a literal `include`. Its world age does not
+# advance mid-body, so a thunk cannot host a define-via-nested-`include`-then-call
+# pattern. Use thunks only for simple inline testsets that are already
+# self-contained; use a file-path body for anything that defines-then-calls across a
+# nested `include` or that should be isolated from other groups.
+function _run_body(body; label::AbstractString = "Group")
     if body isa AbstractString
-        # `using Test` at the `Main` toplevel makes the full Test API (`@testset`,
-        # `@test`, `@test_throws`, `@test_broken`, ...) available to the included
-        # file even if it forgot to load Test itself.
-        Core.eval(Main, :(using Base, Test))
-        Base.include(Main, abspath(body))
+        path = abspath(body)
+        # Build `@safetestset "<label>" begin include("<path>") end` and eval it in
+        # `Main`. The macro name is a `GlobalRef` into `SafeTestsets` so it resolves
+        # even though `Main` (the `Pkg.test` runtests scope) has not `using
+        # SafeTestsets` — `SciMLTesting` owns the dependency. Both the label and the
+        # path are literals because `@safetestset`'s generated module cannot capture
+        # any local variable of this function.
+        expr = Expr(
+            :macrocall,
+            GlobalRef(SafeTestsets, Symbol("@safetestset")),
+            LineNumberNode(@__LINE__, @__FILE__),
+            string(label),
+            Expr(:block, :(include($path))),
+        )
+        Core.eval(Main, expr)
     elseif _callable(body)
         Base.invokelatest(body)
     else
@@ -477,27 +503,37 @@ Let `group = current_group(; env, default)`:
     through to `core`/`qa` above.
   * otherwise — fall through to `core` (an unknown group runs the default body).
 
-# File-path bodies run at the `Main` toplevel (world-age-safe)
+# File-path bodies run in an isolated `@safetestset` (preferred form)
 
-A file-path body is `include`d at the `Main` toplevel — exactly as a hand-written
-`runtests.jl` does `include("core.jl")` under `Pkg.test`. This gives each top-level
-statement of the file the normal per-statement world-age advancement, so a file that
-defines a method via a nested `include(mapexpr, file)` (or plain `include`) and then
-*calls* that method in the same `@testset`/expression works. (Under the old
-fresh-module include this raised a world-age `MethodError`: "method too new to be
-called from this world context".) For this reason **file-path bodies are the
-recommended form for `core`/groups**.
+A file-path body is run inside its own `@safetestset` — a fresh isolated module —
+mirroring OrdinaryDiffEq.jl's canonical `@safetestset "X" begin include("x.jl") end`
+structure. This is the **recommended form for `core`/groups** because it is both
+world-age-safe and isolated:
 
-A thunk body (`() -> ...`) runs inside a single function call, whose world age does
-*not* advance mid-body, so a thunk **cannot** host a define-via-nested-`include`-then-
-call pattern; use a file path for that.
+  * *World-age-safe.* A module body advances world age per top-level statement, so a
+    file that defines a method via a nested `include(mapexpr, file)` (or plain
+    `include`) and then *calls* that method in the same `@testset`/expression works.
+    (Under the old fresh `Module(gensym())` `Base.include` this raised a world-age
+    `MethodError`: "method too new to be called from this world context".)
+  * *Isolated.* Each file body runs in its own module, so a global/const/method one
+    group defines is invisible to the next group — groups cannot leak symbols into
+    one another.
+  * *`Test` is in scope automatically.* `@safetestset` brings the full Test API into
+    the generated module, so an included file needs no `using Test` of its own. (A
+    missing `using Test` in an included file was a recurring source of breakage.)
 
-# `using Test` is guaranteed
+A thunk body (`() -> ...`) is invoked as-is via `invokelatest` in the caller's
+scope. It is **not** isolated and **not** world-age-safe: a runtime closure cannot
+be cleanly `@safetestset`-wrapped with a literal `include`, and its world age does
+not advance mid-body, so a thunk **cannot** host a
+define-via-nested-`include`-then-call pattern. Use a thunk only for a simple inline
+testset that is already self-contained; use a file path for anything that
+defines-then-calls across a nested `include` or that should be isolated from other
+groups.
 
-`Test` is brought into `Main` before a file-path body is `include`d, so an included
-file can use `@testset`/`@test` without its own `using Test`. (A missing `using Test`
-in an included file was a recurring source of breakage; a hand-written runtests.jl's
-own `using Test` already provides this.)
+For a QA group that declares an `env`, the env is activated (`Pkg.activate`) **before**
+the QA body runs; activation is process-global and persists into the `@safetestset`
+module the body is evaluated in.
 
 # No `Pkg` needed in the repo's `[extras]`
 
@@ -569,12 +605,12 @@ function run_tests(;
     if group == "All"
         if all === nothing
             # Legacy default: core, then every in-process functional group, then qa.
-            _run_group_spec(_group_spec(core), parent)
+            _run_group_spec(_group_spec(core), parent; label = "Core")
             for name in sort!(collect(keys(group_table)))
                 spec = _group_spec(group_table[name])
-                spec.env === nothing && _run_body(spec.body)
+                spec.env === nothing && _run_body(spec.body; label = name)
             end
-            qa === nothing || _run_group_spec(_group_spec(qa), parent)
+            qa === nothing || _run_group_spec(_group_spec(qa), parent; label = "QA")
         else
             # Curated "All": run exactly the listed keys, in order. `core` runs only
             # if "Core" is listed; `qa` only if "QA" is listed.
@@ -590,15 +626,15 @@ function run_tests(;
         end
         return nothing
     elseif group == "Core"
-        _run_group_spec(_group_spec(core), parent)
+        _run_group_spec(_group_spec(core), parent; label = "Core")
         return nothing
     elseif group == "QA"
         qa === nothing &&
             throw(ArgumentError("run_tests: GROUP=\"QA\" was requested but no `qa` body was provided"))
-        _run_group_spec(_group_spec(qa), parent)
+        _run_group_spec(_group_spec(qa), parent; label = "QA")
         return nothing
     elseif haskey(group_table, group)
-        _run_group_spec(_group_spec(group_table[group]), parent)
+        _run_group_spec(_group_spec(group_table[group]), parent; label = group)
         return nothing
     end
 
@@ -618,7 +654,7 @@ function run_tests(;
     end
 
     # Unknown group: fall through to the default (core) body.
-    _run_group_spec(_group_spec(core), parent)
+    _run_group_spec(_group_spec(core), parent; label = "Core")
     return nothing
 end
 
@@ -627,13 +663,13 @@ end
 # expansion so a listed key behaves exactly as if it had been requested via GROUP.
 function _run_named_group(key::AbstractString, core, group_table, qa, parent)
     if key == "Core"
-        _run_group_spec(_group_spec(core), parent)
+        _run_group_spec(_group_spec(core), parent; label = "Core")
     elseif key == "QA"
         qa === nothing &&
             throw(ArgumentError("run_tests: \"QA\" was listed in `all`/`umbrellas` but no `qa` body was provided"))
-        _run_group_spec(_group_spec(qa), parent)
+        _run_group_spec(_group_spec(qa), parent; label = "QA")
     elseif haskey(group_table, key)
-        _run_group_spec(_group_spec(group_table[key]), parent)
+        _run_group_spec(_group_spec(group_table[key]), parent; label = key)
     else
         throw(ArgumentError("run_tests: \"$key\" was listed in `all`/`umbrellas` but is not a key of `groups` (nor the reserved \"Core\"/\"QA\")"))
     end
@@ -643,14 +679,18 @@ end
 _as_string_list(x::AbstractString) = [x]
 _as_string_list(xs) = [string(x) for x in xs]
 
-# Activate a group spec's sub-env (if it declares one) and run its body.
-function _run_group_spec(spec::GroupSpec, default_parent)
+# Activate a group spec's sub-env (if it declares one) and run its body. For the QA
+# body the env is activated (`Pkg.activate`) BEFORE the body runs; activation is
+# process-global, so it persists into the `@safetestset` module that `_run_body`
+# evaluates the file in. `label` names the resulting `@safetestset` (the group/core
+# name); it defaults to "Group" when the caller has no name to hand down.
+function _run_group_spec(spec::GroupSpec, default_parent; label::AbstractString = "Group")
     if spec.env !== nothing
         kwargs = spec.parent !== nothing ? (; parent = spec.parent) :
             (default_parent !== nothing ? (; parent = default_parent) : (;))
         activate_group_env(spec.env; kwargs...)
     end
-    _run_body(spec.body)
+    _run_body(spec.body; label = label)
     return nothing
 end
 
