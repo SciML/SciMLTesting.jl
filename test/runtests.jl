@@ -343,6 +343,88 @@ end
         @test isfile(marker)
     end
 
+    @testset "run_tests file body: nested include define-then-call (world age)" begin
+        # Regression (MuladdMacro pattern, InternalJunk#51): a file-path Core body
+        # that, inside a single @testset, defines a function via a nested `include`
+        # of a fixture file and then CALLS that function in the same testset. Under
+        # the old fresh-module `Base.include` (or thunk invokelatest) this raised a
+        # world-age `MethodError` ("method too new to be called from this world
+        # context"); running the body inside its own `@safetestset` (an isolated
+        # module whose body advances world age per top-level statement, exactly like
+        # a hand-written runtests.jl's toplevel `include`) makes the
+        # nested-include-defined method callable in the same expression.
+        root = mktempdir()
+        marker = joinpath(root, "did_run")
+        # Fixture defining the function, included by the body (mirrors MuladdMacro's
+        # `include(to_muladd, testfile)` defining test_muladd_include).
+        fixture = joinpath(root, "fixture.jl")
+        write(fixture, "wa_defined(a, b, c) = a * b + c\n")
+        body = joinpath(root, "core.jl")
+        # Note: the body deliberately has NO `using Test` of its own, and the
+        # include + call happen inside the SAME @testset (the world-age trap).
+        write(
+            body,
+            "@testset \"nested include define-then-call\" begin\n" *
+                "    include(raw\"$(fixture)\")\n" *
+                "    @test wa_defined(2.0, 3.0, 4.0) == 10.0\n" *
+                "end\n" *
+                "write(raw\"$(marker)\", \"ok\")\n",
+        )
+        withenv("GROUP" => "Core") do
+            run_tests(; core = body)
+        end
+        @test isfile(marker)
+    end
+
+    @testset "run_tests file bodies are isolated (@safetestset, no cross-group leak)" begin
+        # Regression: file-path group bodies run in their own `@safetestset` module,
+        # so a global/const/method defined by one group is INVISIBLE to the next.
+        # Group A defines a const, a plain global, and a method; group B must NOT see
+        # any of them (each reference must raise an UndefVarError), proving the two
+        # bodies do not share a namespace.
+        root = mktempdir()
+        a_ran = joinpath(root, "a_ran")
+        b_ran = joinpath(root, "b_ran")
+
+        a = joinpath(root, "a.jl")
+        write(
+            a,
+            "const ISO_CONST = 7\n" *
+                "global iso_global = 11\n" *
+                "iso_method() = ISO_CONST + iso_global\n" *
+                "@testset \"A defines symbols\" begin\n" *
+                "    @test iso_method() == 18\n" *
+                "end\n" *
+                "write(raw\"$(a_ran)\", \"ok\")\n",
+        )
+
+        # Group B references each of A's symbols; in an isolated module each lookup
+        # must throw UndefVarError. If the bodies shared a namespace these would
+        # resolve and the @test ... isa UndefVarError assertions would fail.
+        b = joinpath(root, "b.jl")
+        write(
+            b,
+            "@testset \"B cannot see A's symbols\" begin\n" *
+                "    @test (try; ISO_CONST;  catch e; e; end) isa UndefVarError\n" *
+                "    @test (try; iso_global; catch e; e; end) isa UndefVarError\n" *
+                "    @test (try; iso_method(); catch e; e; end) isa UndefVarError\n" *
+                "end\n" *
+                "write(raw\"$(b_ran)\", \"ok\")\n",
+        )
+
+        # Run A then B as two separate file groups via the umbrella expansion (each
+        # is dispatched as its own group, exactly as a real run would route them).
+        withenv("GROUP" => "Both") do
+            run_tests(;
+                core = () -> nothing,
+                groups = Dict("A" => a, "B" => b),
+                umbrellas = Dict("Both" => ["A", "B"]),
+            )
+        end
+        @test isfile(a_ran)   # A ran and defined its symbols
+        @test isfile(b_ran)   # B ran and (its @tests) confirmed it could not see them
+    end
+
     @testset "run_tests sublib_env handoff (distinct read/handoff vars)" begin
         # Extension 1: a monorepo whose root reads one variable (`GROUP`) but whose
         # sublibraries read a *different* one (`ODEDIFFEQ_TEST_GROUP`). The root must

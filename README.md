@@ -95,8 +95,18 @@ run_qa(MyPackage; Aqua = Aqua)
 
 Key guarantees:
 
-  * **`using Test` is in scope for every included file.** File-path bodies are
-    `include`d into a fresh module that has `using Test`, so an included file may use
+  * **File-path bodies run in an isolated `@safetestset` (world-age-safe + isolated).**
+    A file-path body is run inside its own `@safetestset` — a fresh module —
+    mirroring OrdinaryDiffEq.jl's canonical
+    `@safetestset "X" begin include("x.jl") end`. A module body advances world age
+    per top-level statement, so a file that defines a method via a nested
+    `include(mapexpr, file)` (or plain `include`) and then calls it in the same
+    `@testset` works, and each group runs in its own namespace so globals/consts/
+    methods one group defines do not leak into the next. (A thunk runs in a single
+    function world in the caller's scope: it is neither world-age-safe nor isolated,
+    so use a file path for any define-then-call or isolation-sensitive body.)
+  * **`using Test` is in scope for every included file.** `@safetestset` brings the
+    full Test API into the generated module, so an included file may use
     `@testset`/`@test`/`@test_throws` without its own `using Test`.
   * **Empty/unset `GROUP` and `"All"` are normalized correctly**, and the empty
     group and reserved names (`All`/`Core`/`QA`) are never misrouted to a
