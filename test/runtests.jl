@@ -669,4 +669,329 @@ end
         end
         @test ran_core[] == 4
     end
+
+    @testset "read_test_groups" begin
+        # [groups.X] layout with per-group options.
+        d1 = mktempdir()
+        write(
+            joinpath(d1, "test_groups.toml"),
+            """
+            [groups.Interface]
+            in_all = true
+
+            [groups.QA]
+            in_all = false
+            """,
+        )
+        g1 = read_test_groups(d1)
+        @test sort(collect(keys(g1))) == ["Interface", "QA"]
+        @test g1["Interface"]["in_all"] == true
+        @test g1["QA"]["in_all"] == false
+
+        # Bare top-level layout (each group its own table), empty table = defaults.
+        d2 = mktempdir()
+        write(
+            joinpath(d2, "test_groups.toml"),
+            """
+            [Interface]
+            [QA]
+            in_all = false
+            """,
+        )
+        g2 = read_test_groups(d2)
+        @test sort(collect(keys(g2))) == ["Interface", "QA"]
+        @test isempty(g2["Interface"])           # no options -> default in_all = true
+        @test g2["QA"]["in_all"] == false
+
+        # Missing file is an error (folder mode requires the group list).
+        d3 = mktempdir()
+        @test_throws ArgumentError read_test_groups(d3)
+    end
+
+    @testset "run_tests folder mode: Core = top-level files only" begin
+        # Core = all top-level test/*.jl EXCEPT runtests.jl, NOT recursing into
+        # subfolders. Marker files prove exactly which files ran.
+        tdir = mktempdir()
+        write(joinpath(tdir, "test_groups.toml"), "[Interface]\n")
+        # runtests.jl must NOT be (recursively) run by Core discovery.
+        write(joinpath(tdir, "runtests.jl"), "error(\"runtests.jl was discovered/run\")\n")
+        mkfile(name) = begin
+            write(
+                joinpath(tdir, "$(name).jl"),
+                "@testset \"$(name)\" begin\n  @test true\nend\nwrite(joinpath(@__DIR__, \"ran_$(name)\"), \"1\")\n",
+            )
+        end
+        mkfile("a_core")
+        mkfile("b_core")
+        # A subfolder under the test dir must NOT be picked up by Core (no recursion).
+        mkpath(joinpath(tdir, "subdir"))
+        write(joinpath(tdir, "subdir", "deep.jl"), "error(\"Core recursed into a subfolder\")\n")
+        ran(n) = isfile(joinpath(tdir, "ran_$(n)"))
+
+        withenv("GROUP" => "Core") do
+            run_tests(; test_dir = tdir)
+        end
+        @test ran("a_core") && ran("b_core")  # both top-level files ran
+        # runtests.jl not run (no error thrown) and subdir not recursed (no error).
+    end
+
+    @testset "run_tests folder mode: named group runs ALL its files (enforced)" begin
+        # A named group folder runs EVERY *.jl in it: 3 files -> all 3 run. This is the
+        # enforcement guarantee (you cannot forget to register a file).
+        tdir = mktempdir()
+        write(joinpath(tdir, "test_groups.toml"), "[Interface]\n")
+        write(joinpath(tdir, "core_only.jl"), "@test true\n")  # a Core file (unused here)
+        gdir = joinpath(tdir, "Interface"); mkpath(gdir)
+        for f in ("one", "two", "three")
+            write(
+                joinpath(gdir, "$(f).jl"),
+                "@testset \"$(f)\" begin\n  @test true\nend\nwrite(joinpath(@__DIR__, \"ran_$(f)\"), \"1\")\n",
+            )
+        end
+        ran(n) = isfile(joinpath(gdir, "ran_$(n)"))
+
+        withenv("GROUP" => "Interface") do
+            run_tests(; test_dir = tdir)
+        end
+        @test ran("one") && ran("two") && ran("three")  # all 3 files ran
+    end
+
+    @testset "run_tests folder mode: case-insensitive folder match" begin
+        # group "Interface" finds a lowercase test/interface/ folder.
+        tdir = mktempdir()
+        write(joinpath(tdir, "test_groups.toml"), "[Interface]\n")
+        write(joinpath(tdir, "c.jl"), "@test true\n")
+        gdir = joinpath(tdir, "interface"); mkpath(gdir)   # lowercase folder
+        write(
+            joinpath(gdir, "x.jl"),
+            "@testset \"x\" begin @test true end\nwrite(joinpath(@__DIR__, \"ran\"), \"1\")\n",
+        )
+        withenv("GROUP" => "Interface") do
+            run_tests(; test_dir = tdir)
+        end
+        @test isfile(joinpath(gdir, "ran"))
+    end
+
+    @testset "run_tests folder mode: QA folder with own Project.toml is activated" begin
+        # QA folder has its own Project.toml -> activate_group_env (Pkg.activate +
+        # develop pkg by path + instantiate) before running its files. We prove
+        # activation happened by having the QA file record Base.active_project().
+        original_project = Base.active_project()
+        repo = mktempdir()
+        write(
+            joinpath(repo, "Project.toml"),
+            """
+            name = "TinyQAPkg"
+            uuid = "33333333-3333-3333-3333-333333333333"
+            version = "0.1.0"
+            """,
+        )
+        mkpath(joinpath(repo, "src"))
+        write(joinpath(repo, "src", "TinyQAPkg.jl"), "module TinyQAPkg\nend\n")
+        tdir = joinpath(repo, "test"); mkpath(tdir)
+        write(joinpath(tdir, "test_groups.toml"), "[QA]\nin_all = false\n")
+        write(joinpath(tdir, "main.jl"), "@test true\n")  # a Core file
+        qadir = joinpath(tdir, "qa"); mkpath(qadir)
+        # Empty (deps-free) group Project.toml -> activate_group_env develops the repo
+        # root into it and instantiates.
+        write(joinpath(qadir, "Project.toml"), "")
+        seen = joinpath(repo, "seen_project")
+        write(
+            joinpath(qadir, "qa.jl"),
+            "@testset \"qa\" begin\n  @test true\nend\n" *
+                "write(raw\"$(seen)\", Base.active_project())\n",
+        )
+        try
+            withenv("GROUP" => "QA") do
+                run_tests(; test_dir = tdir)
+            end
+            @test isfile(seen)
+            # The active project during the QA file run was the qa/ group env, and the
+            # repo-root package was developed into it.
+            @test read(seen, String) == joinpath(qadir, "Project.toml")
+            envdeps = Pkg.TOML.parsefile(joinpath(qadir, "Project.toml"))
+            @test haskey(get(envdeps, "deps", Dict()), "TinyQAPkg")
+        finally
+            Pkg.activate(original_project)
+        end
+    end
+
+    @testset "run_tests folder mode: All = Core + groups, NOT QA, honors in_all=false" begin
+        # "All" runs Core (top-level files) + every group folder EXCEPT QA and except
+        # any group with in_all = false. Heavy (in_all = false) and QA must not run;
+        # Light must.
+        tdir = mktempdir()
+        write(
+            joinpath(tdir, "test_groups.toml"),
+            """
+            [Light]
+            [Heavy]
+            in_all = false
+            [QA]
+            """,
+        )
+        markerfile(rel, name) = "write(joinpath(@__DIR__, \"$(rel)ran_$(name)\"), \"1\")\n"
+        # Core top-level file.
+        write(
+            joinpath(tdir, "core.jl"),
+            "@testset \"core\" begin @test true end\n" * markerfile("", "core"),
+        )
+        for (grp, file) in (("Light", "l"), ("Heavy", "h"))
+            d = joinpath(tdir, grp); mkpath(d)
+            write(
+                joinpath(d, "$(file).jl"),
+                "@testset \"$(file)\" begin @test true end\n" * markerfile("../", "$(grp)"),
+            )
+        end
+        qd = joinpath(tdir, "qa"); mkpath(qd)
+        write(
+            joinpath(qd, "q.jl"),
+            "@testset \"q\" begin @test true end\n" * markerfile("../", "QA"),
+        )
+        ran(n) = isfile(joinpath(tdir, "ran_$(n)"))
+
+        withenv("GROUP" => "All") do
+            run_tests(; test_dir = tdir)
+        end
+        @test ran("core")          # Core (top-level files) ran
+        @test ran("Light")         # in_all (default) group ran
+        @test !ran("Heavy")        # in_all = false excluded from All
+        @test !ran("QA")           # QA always excluded from All
+
+        # Heavy and QA are still selectable by name.
+        rm(joinpath(tdir, "ran_core")); rm(joinpath(tdir, "ran_Light"))
+        withenv("GROUP" => "Heavy") do
+            run_tests(; test_dir = tdir)
+        end
+        @test ran("Heavy") && !ran("Light") && !ran("core") && !ran("QA")
+    end
+
+    @testset "run_tests folder mode: non-group subfolder (shared/) is ignored" begin
+        # A subfolder that is NOT a declared group (test/shared/) is never discovered.
+        # It is where shared include/fixture files live. Selecting any group must not
+        # run files inside it.
+        tdir = mktempdir()
+        write(joinpath(tdir, "test_groups.toml"), "[Interface]\n")
+        write(
+            joinpath(tdir, "core.jl"),
+            "@testset \"c\" begin @test true end\nwrite(joinpath(@__DIR__, \"ran_core\"), \"1\")\n",
+        )
+        gdir = joinpath(tdir, "Interface"); mkpath(gdir)
+        write(
+            joinpath(gdir, "i.jl"),
+            "@testset \"i\" begin @test true end\nwrite(joinpath(@__DIR__, \"..\", \"ran_i\"), \"1\")\n",
+        )
+        # shared/ is NOT a group: its file must never auto-run (it would error if it did).
+        shared = joinpath(tdir, "shared"); mkpath(shared)
+        write(joinpath(shared, "fixture.jl"), "error(\"shared/ was auto-discovered\")\n")
+
+        ran(n) = isfile(joinpath(tdir, "ran_$(n)"))
+        withenv("GROUP" => "Core") do
+            run_tests(; test_dir = tdir)
+        end
+        @test ran("core")  # Core ran; shared/ not discovered (no error)
+        rm(joinpath(tdir, "ran_core"))
+        withenv("GROUP" => "Interface") do
+            run_tests(; test_dir = tdir)
+        end
+        @test ran("i")     # Interface ran; shared/ still not discovered
+    end
+
+    @testset "run_tests folder mode: @safetestset isolation between files" begin
+        # Each discovered file runs in its own @safetestset module, so a def in one
+        # file is invisible to another in the same group. File a defines symbols; file
+        # b asserts each lookup throws UndefVarError. Sorted order makes a.jl run first.
+        tdir = mktempdir()
+        write(joinpath(tdir, "test_groups.toml"), "[Iso]\n")
+        write(joinpath(tdir, "main.jl"), "@test true\n")
+        gdir = joinpath(tdir, "Iso"); mkpath(gdir)
+        write(
+            joinpath(gdir, "a.jl"),
+            "const ISO_CONST = 7\n" *
+                "global iso_global = 11\n" *
+                "iso_method() = ISO_CONST + iso_global\n" *
+                "@testset \"a defines\" begin @test iso_method() == 18 end\n" *
+                "write(joinpath(@__DIR__, \"ran_a\"), \"1\")\n",
+        )
+        write(
+            joinpath(gdir, "b.jl"),
+            "@testset \"b cannot see a\" begin\n" *
+                "  @test (try; ISO_CONST;   catch e; e; end) isa UndefVarError\n" *
+                "  @test (try; iso_global;  catch e; e; end) isa UndefVarError\n" *
+                "  @test (try; iso_method(); catch e; e; end) isa UndefVarError\n" *
+                "end\n" *
+                "write(joinpath(@__DIR__, \"ran_b\"), \"1\")\n",
+        )
+        withenv("GROUP" => "Iso") do
+            run_tests(; test_dir = tdir)
+        end
+        @test isfile(joinpath(gdir, "ran_a")) && isfile(joinpath(gdir, "ran_b"))
+    end
+
+    @testset "run_tests folder mode: missing / empty group folder errors" begin
+        # A declared group whose folder is MISSING is an error (mis-named group).
+        tdir = mktempdir()
+        write(joinpath(tdir, "test_groups.toml"), "[Interface]\n")
+        write(joinpath(tdir, "core.jl"), "@test true\n")
+        # No test/Interface/ folder at all.
+        withenv("GROUP" => "Interface") do
+            @test_throws ArgumentError run_tests(; test_dir = tdir)
+        end
+
+        # A declared group whose folder EXISTS but is EMPTY (no *.jl) is an error.
+        tdir2 = mktempdir()
+        write(joinpath(tdir2, "test_groups.toml"), "[Interface]\n")
+        write(joinpath(tdir2, "core.jl"), "@test true\n")
+        mkpath(joinpath(tdir2, "Interface"))  # empty folder
+        withenv("GROUP" => "Interface") do
+            @test_throws ArgumentError run_tests(; test_dir = tdir2)
+        end
+
+        # An empty Core (no top-level test files) is an error.
+        tdir3 = mktempdir()
+        write(joinpath(tdir3, "test_groups.toml"), "[Interface]\n")
+        mkpath(joinpath(tdir3, "Interface"))
+        write(joinpath(tdir3, "Interface", "i.jl"), "@test true\n")
+        # runtests.jl alone is not a Core test file; Core is empty.
+        write(joinpath(tdir3, "runtests.jl"), "@test true\n")
+        withenv("GROUP" => "Core") do
+            @test_throws ArgumentError run_tests(; test_dir = tdir3)
+        end
+
+        # An unknown GROUP (not All/Core/QA, not declared) is an error.
+        tdir4 = mktempdir()
+        write(joinpath(tdir4, "test_groups.toml"), "[Interface]\n")
+        write(joinpath(tdir4, "core.jl"), "@test true\n")
+        withenv("GROUP" => "Bogus") do
+            @test_throws ArgumentError run_tests(; test_dir = tdir4)
+        end
+    end
+
+    @testset "run_tests explicit-args mode still works (backward-compat)" begin
+        # Supplying core (or groups/qa) selects the v1.1.x explicit-args mode even
+        # without a test_groups.toml present in the caller's dir.
+        root = mktempdir()
+        marker = joinpath(root, "core_ran")
+        body = joinpath(root, "body.jl")
+        write(
+            body,
+            "@testset \"explicit core\" begin @test true end\nwrite(raw\"$(marker)\", \"1\")\n",
+        )
+        withenv("GROUP" => "Core") do
+            run_tests(; core = body)   # explicit core -> legacy mode, no folder discovery
+        end
+        @test isfile(marker)
+
+        # Explicit groups-only (core unset) also selects legacy mode.
+        marker2 = joinpath(root, "grp_ran")
+        gbody = joinpath(root, "grp.jl")
+        write(
+            gbody,
+            "@testset \"g\" begin @test true end\nwrite(raw\"$(marker2)\", \"1\")\n",
+        )
+        withenv("GROUP" => "G") do
+            run_tests(; groups = Dict("G" => gbody))
+        end
+        @test isfile(marker2)
+    end
 end

@@ -40,7 +40,8 @@ test = ["Test", "SciMLTesting", ...]
 
 | Helper | Summary |
 | --- | --- |
-| `run_tests(; core, groups, qa, env, default, sublib_env, all, umbrellas, lib_dir, parent, pkg)` | Declarative top-level dispatcher: owns the whole `runtests.jl` group-routing flow. |
+| `run_tests(; test_dir, core, groups, qa, env, default, sublib_env, all, umbrellas, lib_dir, parent, pkg)` | Declarative top-level dispatcher: owns the whole `runtests.jl` group-routing flow. With no `core`/`groups`/`qa` it runs in folder-discovery mode (groups = folders); supplying any of them selects the explicit-args mode. |
+| `read_test_groups(test_dir)` | Read `test_dir/test_groups.toml` (the group list + per-group config such as `in_all`) used by folder-discovery mode. |
 | `current_group(; env = "GROUP", default = "All")` | Read the test-group env var, defaulting to `"All"` (empty string also normalizes to the default). |
 | `activate_group_env(group_dir; parent, develop, instantiate, develop_sources)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. |
 | `develop_sources!(group_dir; parent)` | On Julia < 1.11, `Pkg.develop` the env's `[sources]` path graph (recursively); a no-op on 1.11+. |
@@ -60,9 +61,94 @@ test bodies themselves load, e.g. `Aqua`/`JET` in a QA sub-env). This removes th
 
 ## Usage
 
-### The `run_tests` dispatcher
+### Folder-discovery mode (the default — `run_tests()`)
 
-`run_tests` is the recommended top-level entry point: it owns the entire
+The recommended layout uses **folder discovery**: call `run_tests()` with no
+arguments and let it discover test files from folders. A whole `test/runtests.jl`
+becomes:
+
+```julia
+# test/runtests.jl
+using SciMLTesting
+run_tests()
+```
+
+with a `test/test_groups.toml` that is the single source of truth for both the CI
+matrix and the test groups:
+
+```toml
+# test/test_groups.toml — lists the groups (CI matrix) + per-group config
+[Core]
+versions = ["lts", "1", "pre"]
+os = ["ubuntu-latest", "macos-latest", "windows-latest"]
+
+[Interface]              # a named group => test/Interface/*.jl
+
+[QA]                     # QA => test/qa/*.jl; always excluded from "All"
+versions = ["lts", "1"]
+```
+
+and a test directory laid out as folders:
+
+```
+test/
+├── runtests.jl          # using SciMLTesting; run_tests()
+├── test_groups.toml     # the group list + CI config
+├── basic_tests.jl       # Core  = the top-level test/*.jl files
+├── more_tests.jl        # Core  (every top-level file runs, runtests.jl excluded)
+├── Interface/           # group "Interface"  => all of test/Interface/*.jl
+│   ├── a.jl
+│   └── b.jl
+├── qa/                  # group "QA"  => all of test/qa/*.jl
+│   ├── Project.toml     #   a sub-env: Aqua/JET/... live here, activated first
+│   └── qa.jl
+└── shared/              # NOT a declared group => never auto-discovered
+    └── fixtures.jl      #   helpers/fixtures `include`d by test files live here
+```
+
+How a `GROUP` maps to files (each file runs via the isolated `@safetestset` include
+path, in sorted order, labelled `"<group>/<basename>"`):
+
+  * **`Core`** → every top-level `test/*.jl` **except** `runtests.jl`, without
+    recursing into subdirectories. (Core = the main test folder, the normal SciML
+    layout.) Core uses the main test env — no activation.
+  * **a named group `X`** (any `test_groups.toml` key other than `Core`/`QA`) → every
+    `*.jl` in `test/X/`, matching the folder name exactly then case-insensitively
+    (`Interface` finds `test/Interface/` or `test/interface/`).
+  * **`QA`** → every `*.jl` in `test/qa/` (or `test/QA/`).
+  * **`All`** (unset/empty `GROUP`) → Core **plus** every group folder in
+    `test_groups.toml` **except** `QA` and except any group marked `in_all = false`
+    (curated All).
+
+Guarantees specific to folder mode:
+
+  * **Enforced coverage.** *Every* `*.jl` in the selected group's folder runs — you
+    cannot forget to register a test file by leaving it out of an `include` list. A
+    declared group whose folder is **missing or empty** is an **error** (catches a
+    mis-named or empty group), as is an empty `Core` and an unknown `GROUP`.
+  * **Sub-env per group.** If a group folder has its own `Project.toml` (e.g.
+    `test/qa/Project.toml`), it is activated (`Pkg.activate` + develop the package by
+    path + `instantiate`, with the `<1.11` `[sources]` backport) before its files
+    run. Core has no `Project.toml`, so it uses the main test env.
+  * **Helpers/fixtures.** Only the *selected group's* folder is globbed, so a subfolder
+    that is **not** a declared group (e.g. `test/shared/`) is never auto-discovered —
+    that is where shared `include` fixtures and helper files live.
+
+Override the discovered directory with `test_dir = @__DIR__` if `run_tests` cannot
+infer the call site (e.g. when called indirectly). Supplying any of `core`/`groups`/
+`qa` switches to the explicit-args mode documented next.
+
+> **Add `SafeTestsets` (and `Test`) to your test target.** Folder mode runs each file
+> inside a `@safetestset`, whose generated module does `using Test, SafeTestsets`, so
+> both must be resolvable from the active project — list `SafeTestsets` and `Test` in
+> the repo's `[extras]`/`test` target, and in any group sub-env (e.g.
+> `test/qa/Project.toml`) whose files also run under `@safetestset`. This matches the
+> existing SciML convention for `@safetestset`-based suites (OrdinaryDiffEq.jl, ...).
+
+### The `run_tests` dispatcher (explicit-args mode)
+
+For repos that need bespoke routing, `run_tests` also accepts explicit `core`/
+`groups`/`qa` arguments — supplying any of them selects this mode. It owns the entire
 group-routing control flow, so a repo replaces its hand-written
 `if GROUP == "All" ... elseif GROUP == "QA" ...` ladder with one declarative call.
 

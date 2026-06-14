@@ -37,11 +37,139 @@ using Test: Test, @testset, @test
 using SafeTestsets: SafeTestsets, @safetestset
 
 export current_group, activate_group_env, run_qa, detect_sublibrary_group,
-    develop_sources!, run_tests
+    develop_sources!, run_tests, read_test_groups
 
 # Group names that are never sublibraries and never named functional groups: the
 # routing keywords `run_tests` and `detect_sublibrary_group` reserve.
 const RESERVED_GROUPS = ("All", "Core", "QA")
+
+"""
+    read_test_groups(test_dir) -> Dict{String, Dict{String, Any}}
+
+Read a repo's `test/test_groups.toml` and return the declared groups as an ordered
+mapping from group name to that group's option table.
+
+`test_dir` is the directory holding `runtests.jl` (the dir of the calling file). The
+file at `joinpath(test_dir, "test_groups.toml")` is the single source of truth for
+both the CI test matrix (the group *names*) and per-group configuration consumed by
+the folder-discovery mode of [`run_tests`](@ref). Two TOML layouts are accepted:
+
+  * A `[groups]` table whose subtables name the groups:
+
+    ```toml
+    [groups.Interface]
+    in_all = true
+
+    [groups.QA]
+    in_all = false
+    ```
+
+  * A bare top-level layout where each group is its own table (no `groups` wrapper):
+
+    ```toml
+    [Interface]
+    [QA]
+    in_all = false
+    ```
+
+A group whose value is an empty table (or `true`) declares the group with default
+options. Recognized per-group options:
+
+  * `in_all` (`Bool`, default `true`) — whether the group runs as part of the `"All"`
+    aggregate. `"QA"` is always excluded from `"All"` regardless of this flag (set it
+    explicitly to `false` for documentation/clarity). Set `in_all = false` on any
+    heavy or environment-specific group to curate `"All"`.
+
+The returned dict preserves declaration order (insertion-ordered), and group names
+are returned verbatim (SciML group names are capitalized: `Core`, `QA`, `Interface`,
+...). Missing file is an error: folder-discovery mode requires the group list.
+
+# Examples
+
+```julia
+groups = read_test_groups(@__DIR__)            # in test/runtests.jl
+for (name, opts) in groups
+    @info name get(opts, "in_all", true)
+end
+```
+"""
+function read_test_groups(test_dir::AbstractString)
+    file = joinpath(test_dir, "test_groups.toml")
+    isfile(file) ||
+        throw(ArgumentError("read_test_groups: no test_groups.toml found at $(file). Folder-discovery mode requires a test_groups.toml listing the test groups."))
+    parsed = TOML.parsefile(file)
+    raw = get(parsed, "groups", nothing)
+    raw isa AbstractDict || (raw = parsed)
+    # Preserve declaration order: TOML.parsefile returns a plain Dict (unordered), so
+    # re-key into an order-preserving structure keyed by first appearance in the file
+    # text would require a streaming parser. The group set is what matters for
+    # discovery, and "All" iterates a *sorted* group list (deterministic) regardless,
+    # so a plain Dict suffices; sorting at the call site gives the determinism.
+    out = Dict{String, Dict{String, Any}}()
+    for (name, val) in raw
+        name == "groups" && continue   # in the bare layout, ignore a stray wrapper key
+        opts = if val isa AbstractDict
+            Dict{String, Any}(string(k) => v for (k, v) in val)
+        elseif val === true
+            Dict{String, Any}()
+        else
+            throw(ArgumentError("read_test_groups: group \"$name\" must map to a table (or `true`); got $(typeof(val)) in $(file)"))
+        end
+        out[string(name)] = opts
+    end
+    return out
+end
+
+# Whether a declared group runs as part of "All". QA is always excluded from "All"
+# (it is its own CI lane); any group with `in_all = false` opts out (curated All).
+_group_in_all(name::AbstractString, opts::AbstractDict) =
+    name != "QA" && get(opts, "in_all", true) == true
+
+# Resolve a group name to its folder under `test_dir`, trying an exact match first
+# then a case-insensitive match (so group "Interface" finds test/Interface or
+# test/interface, and "QA" finds test/qa or test/QA). Returns the absolute folder
+# path, or `nothing` if no matching directory exists.
+function _group_folder(test_dir::AbstractString, name::AbstractString)
+    exact = joinpath(test_dir, name)
+    isdir(exact) && return abspath(exact)
+    lname = lowercase(name)
+    for entry in readdir(test_dir)
+        isdir(joinpath(test_dir, entry)) || continue
+        lowercase(entry) == lname && return abspath(joinpath(test_dir, entry))
+    end
+    return nothing
+end
+
+# Top-level `*.jl` test files directly in `test_dir`, excluding `runtests.jl`, NOT
+# recursing into subdirectories. This is the Core group's file set (the normal SciML
+# layout where the main test folder *is* Core). Returned sorted (deterministic run
+# order).
+function _core_files(test_dir::AbstractString)
+    files = String[]
+    for entry in readdir(test_dir)
+        endswith(entry, ".jl") || continue
+        entry == "runtests.jl" && continue
+        path = joinpath(test_dir, entry)
+        isfile(path) || continue
+        push!(files, abspath(path))
+    end
+    sort!(files)
+    return files
+end
+
+# All `*.jl` files directly inside a group's folder, sorted. Does not recurse: a
+# group folder's own subfolders (if any) are not auto-discovered.
+function _folder_files(folder::AbstractString)
+    files = String[]
+    for entry in readdir(folder)
+        endswith(entry, ".jl") || continue
+        path = joinpath(folder, entry)
+        isfile(path) || continue
+        push!(files, abspath(path))
+    end
+    sort!(files)
+    return files
+end
 
 """
     current_group(; env = "GROUP", default = "All")
@@ -421,6 +549,128 @@ function _run_body(body; label::AbstractString = "Group")
     return nothing
 end
 
+# Sentinel marking an unsupplied explicit-mode argument. When all of `core`,
+# `groups`, and `qa` are still the sentinel, `run_tests` runs in folder-discovery
+# mode; supplying any one of them selects the legacy explicit-args mode.
+struct _Unset end
+const _UNSET = _Unset()
+
+# Directory of the file that called `run_tests` (the repo's test/runtests.jl), used
+# as the default `test_dir` in folder-discovery mode. Walks the backtrace outward
+# from `run_tests`, skipping frames inside this module's own source file, and returns
+# the directory of the first external frame with a real file. This lets a repo write
+# a bare `run_tests()` in test/runtests.jl with no `@__DIR__` plumbing. If no external
+# file frame is found (e.g. called from the REPL), errors with guidance to pass
+# `test_dir` explicitly.
+function _caller_test_dir()
+    self = @__FILE__
+    for frame in stacktrace()
+        file = string(frame.file)
+        isempty(file) && continue
+        # Skip frames in SciMLTesting's own source and synthetic/REPL frames.
+        (file == self || abspath(file) == abspath(self)) && continue
+        startswith(file, "./") && continue
+        occursin("REPL", file) && continue
+        path = abspath(file)
+        isfile(path) && return dirname(path)
+    end
+    throw(ArgumentError("run_tests (folder mode): could not determine the test directory from the call site; pass `test_dir = @__DIR__` explicitly (e.g. `run_tests(; test_dir = @__DIR__)`)."))
+end
+
+# ---------------------------------------------------------------------------
+# Folder-discovery mode
+#
+# Triggered when `run_tests` is called with no `core`/`groups`/`qa`. The test
+# directory's `test_groups.toml` is the group list + per-group config; each group
+# maps to a folder of `.jl` files that are discovered and run (enforced — every file
+# in the selected group's folder runs). Mapping:
+#   * "Core" -> top-level test/*.jl (minus runtests.jl), no recursion
+#   * named group "X" -> test/X/  (exact, then case-insensitive)
+#   * "QA" -> test/qa/ (or test/QA/)
+#   * "All" -> Core + every group folder except QA and except in_all=false groups
+# A declared group whose folder is missing or empty is an ERROR (catches mis-named or
+# empty groups). Each discovered file runs via the same isolated @safetestset path as
+# explicit mode (`_run_body`), labelled "<group>/<basename>", in sorted order.
+# ---------------------------------------------------------------------------
+
+# Run the Core file set: top-level test/*.jl (no Project.toml activation — Core uses
+# the main test env). Errors if there are no top-level test files (an empty Core is a
+# misconfiguration: the normal SciML layout puts the main tests at the top level).
+function _run_core_folder(test_dir::AbstractString)
+    files = _core_files(test_dir)
+    isempty(files) &&
+        throw(ArgumentError("run_tests (folder mode): the \"Core\" group is empty — no top-level *.jl test files (other than runtests.jl) found in $(test_dir). Core = the top-level test folder; put the main test files there."))
+    for f in files
+        _run_body(f; label = string("Core/", basename(f)))
+    end
+    return nothing
+end
+
+# Run a named (non-Core, non-QA / or QA) group folder. Resolves the folder (exact
+# then case-insensitive), errors if it is MISSING or EMPTY (enforced coverage —
+# catches a declared-but-mis-named/empty group), activates a sub-env if the folder
+# has its own Project.toml, then runs every *.jl file in sorted order. `default_parent`
+# is forwarded to `activate_group_env` for the sub-env develop step.
+function _run_group_folder(test_dir::AbstractString, name::AbstractString, default_parent)
+    folder = _group_folder(test_dir, name)
+    folder === nothing &&
+        throw(ArgumentError("run_tests (folder mode): group \"$name\" is declared in test_groups.toml but its folder is missing — expected $(joinpath(test_dir, name)) (or a case-insensitive match). Create the folder and add its test files, or remove the group from test_groups.toml."))
+    files = _folder_files(folder)
+    isempty(files) &&
+        throw(ArgumentError("run_tests (folder mode): group \"$name\" folder $(folder) contains no *.jl files. Every declared group must have at least one test file (enforced coverage)."))
+    # A group folder with its own Project.toml is a sub-env: activate + develop the
+    # package under test + instantiate before running its files (reusing the existing
+    # activate_group_env logic, which includes the <1.11 [sources] backport).
+    if _project_file(folder) !== nothing
+        kwargs = default_parent !== nothing ? (; parent = default_parent) : (;)
+        activate_group_env(folder; kwargs...)
+    end
+    for f in files
+        _run_body(f; label = string(name, "/", basename(f)))
+    end
+    return nothing
+end
+
+# Dispatch one group in folder-discovery mode. `group_table` is the parsed
+# test_groups.toml (name => options). Resolves the reserved "Core"/"All"/"QA" and any
+# declared named group to its folder(s).
+function _run_folder_group(
+        group::AbstractString,
+        test_dir::AbstractString,
+        group_table::AbstractDict,
+        default_parent,
+    )
+    if group == "All"
+        _run_core_folder(test_dir)
+        # Every declared group that opts into All (QA excluded, in_all=false excluded),
+        # in sorted order for determinism. "Core" as a declared key is folded into the
+        # top-level Core run above and not re-run as a folder.
+        for name in sort!(collect(keys(group_table)))
+            name in ("Core", "QA") && continue
+            _group_in_all(name, group_table[name]) || continue
+            _run_group_folder(test_dir, name, default_parent)
+        end
+        return nothing
+    elseif group == "Core"
+        _run_core_folder(test_dir)
+        return nothing
+    elseif group == "QA"
+        # QA need not appear in test_groups.toml to be selectable, but if declared its
+        # options are still honored for All-exclusion. Folder is test/qa or test/QA.
+        _run_group_folder(test_dir, "QA", default_parent)
+        return nothing
+    elseif haskey(group_table, group)
+        _run_group_folder(test_dir, group, default_parent)
+        return nothing
+    else
+        # An unknown group in folder mode is an error rather than a silent Core
+        # fallthrough: in this mode the group set is fully declared in
+        # test_groups.toml, so an unrecognized GROUP is almost certainly a typo.
+        known = sort!(collect(keys(group_table)))
+        throw(ArgumentError("run_tests (folder mode): GROUP=\"$group\" is not \"All\"/\"Core\"/\"QA\" and is not a group declared in test_groups.toml (declared: $(known)). Add it to test_groups.toml or fix the GROUP value."))
+    end
+end
+
 """
     run_tests(; core, groups = Dict(), qa = nothing,
               env = "GROUP", default = "All", sublib_env = env,
@@ -430,6 +680,58 @@ end
 Declarative top-level dispatcher for a SciML `test/runtests.jl`. It owns the whole
 group-routing control flow, so a repo replaces its hand-written `if GROUP == "All"
 ... elseif GROUP == "QA" ...` ladder with a single call.
+
+`run_tests` has two modes:
+
+# Folder-discovery mode (default — call `run_tests()` with no `core`/`groups`/`qa`)
+
+When none of `core`, `groups`, or `qa` is supplied, `run_tests` discovers test files
+from folders, so a repo's whole `test/runtests.jl` becomes:
+
+```julia
+using SciMLTesting
+run_tests()
+```
+
+The model:
+
+  * The calling file is `test/runtests.jl`, so the **test directory** is the caller's
+    directory (override with the `test_dir` keyword). `test_dir/test_groups.toml` is
+    the single source of truth: it lists the **groups** (the CI matrix) and holds
+    per-group config (see [`read_test_groups`](@ref)).
+  * `group = current_group(; env, default)` selects which group runs.
+  * **Folder mapping** (files run via the same isolated `@safetestset` include path as
+    explicit mode, in sorted order, labelled `"<group>/<basename>"`):
+      - `"Core"` → all top-level `test_dir/*.jl` **except** `runtests.jl`, not
+        recursing into subdirectories. (Core = the main test folder, the normal SciML
+        layout.) Core uses the main test env (no activation).
+      - a named group `"X"` (a `test_groups.toml` key other than `Core`/`QA`) → all
+        `*.jl` in `test_dir/X/`, matching the folder to the group name by exact then
+        case-insensitive match (group `"Interface"` ⇒ `test/Interface/` or
+        `test/interface/`).
+      - `"QA"` → all `*.jl` in `test_dir/qa/` (or `test_dir/QA/`).
+      - `"All"` → Core (top-level files) **plus** every group folder listed in
+        `test_groups.toml` **except** `"QA"` and except any group with `in_all = false`
+        (curated All).
+  * **Sub-env per group.** If a resolved group folder contains a `Project.toml`, it is
+    activated ([`activate_group_env`](@ref): `Pkg.activate` + develop the package by
+    path + instantiate, with the `<1.11` [`develop_sources!`](@ref) backport) before
+    running that folder's files. Core uses the main test env (no activation). The
+    develop-parent defaults to the repo root (`dirname(test_dir)`); override with
+    `parent`.
+  * **Enforced coverage.** *Every* `*.jl` file in the selected group's folder runs —
+    you cannot forget to register a test file. A declared group whose folder is
+    **missing or empty** is an **error** (catches a mis-named or empty group), as is an
+    empty `"Core"`. An unknown `GROUP` (not `All`/`Core`/`QA` and not declared) is also
+    an error rather than a silent fall-through.
+  * **Helpers / fixtures.** Only the *selected group's* folder is globbed, so any
+    subfolder that is **not** a declared group (e.g. `test/shared/`) is never
+    auto-discovered — that is where shared `include` fixtures and helper files live.
+
+# Explicit-args mode (v1.1.x — backward-compatible)
+
+Supplying any of `core`, `groups`, or `qa` selects the explicit-args mode below, whose
+behavior is unchanged from v1.1.x.
 
 # Arguments
 
@@ -482,8 +784,12 @@ group-routing control flow, so a repo replaces its hand-written `if GROUP == "Al
     group that declares an `env` but no `parent` of its own.
   * `pkg` — optional package name/`PackageSpec` to `Pkg.test` for a matched
     sublibrary; defaults to the sublibrary name.
+  * `test_dir` — (folder-discovery mode) the test directory holding `test_groups.toml`
+    and the group folders. Defaults to the directory of the file that called
+    `run_tests` (the repo's `test/runtests.jl`); pass `test_dir = @__DIR__` if it
+    cannot be inferred from the call site.
 
-# Routing
+# Routing (explicit-args mode)
 
 Let `group = current_group(; env, default)`:
 
@@ -586,9 +892,9 @@ run_tests(;
 ```
 """
 function run_tests(;
-        core,
-        groups = Dict{String, Any}(),
-        qa = nothing,
+        core = _UNSET,
+        groups = _UNSET,
+        qa = _UNSET,
         env::AbstractString = "GROUP",
         default::AbstractString = "All",
         sublib_env::AbstractString = env,
@@ -597,8 +903,29 @@ function run_tests(;
         lib_dir = nothing,
         parent = nothing,
         pkg = nothing,
+        test_dir = nothing,
     )
     group = current_group(; env = env, default = default)
+
+    # Folder-discovery mode: no explicit core/groups/qa. The test_groups.toml in the
+    # test directory is the group list + per-group config; groups map to folders of
+    # *.jl files that are discovered and run (enforced). See `_run_folder_group`.
+    if core === _UNSET && groups === _UNSET && qa === _UNSET
+        dir = test_dir === nothing ? _caller_test_dir() : abspath(String(test_dir))
+        group_table = read_test_groups(dir)
+        # Default the develop-parent for any sub-env (e.g. test/qa/Project.toml) to the
+        # repo root inferred as dirname(test_dir), unless the caller overrode `parent`.
+        default_parent = parent === nothing ? dirname(dir) : parent
+        _run_folder_group(group, dir, group_table, default_parent)
+        return nothing
+    end
+
+    # Explicit-args mode (v1.1.x backward-compat): fill in the legacy defaults for any
+    # unset argument so the existing control flow below is unchanged.
+    core === _UNSET && (core = nothing)
+    groups = groups === _UNSET ? Dict{String, Any}() : groups
+    qa === _UNSET && (qa = nothing)
+
     group_table = _as_string_dict(groups)
     umbrella_table = _as_string_dict(umbrellas)
 
