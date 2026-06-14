@@ -258,7 +258,7 @@ end
             # run_tests must bring Test into scope for it.
             write(
                 p,
-                "@testset \"$(name)\" begin\n    @test true\nend\nwrite(\"$(marker(name))\", \"1\")\n"
+                "@testset \"$(name)\" begin\n    @test true\nend\nwrite($(repr(marker(name))), \"1\")\n"
             )
             p
         end
@@ -335,7 +335,7 @@ end
                 "    @test 1 + 1 == 2\n" *
                 "    @test_throws BoundsError [1][2]\n" *
                 "end\n" *
-                "write(\"$(marker)\", \"ok\")\n"
+                "write($(repr(marker)), \"ok\")\n"
         )
         withenv("GROUP" => "Core") do
             run_tests(; core = body)
@@ -365,10 +365,10 @@ end
         write(
             body,
             "@testset \"nested include define-then-call\" begin\n" *
-                "    include(raw\"$(fixture)\")\n" *
+                "    include($(repr(fixture)))\n" *
                 "    @test wa_defined(2.0, 3.0, 4.0) == 10.0\n" *
                 "end\n" *
-                "write(raw\"$(marker)\", \"ok\")\n",
+                "write($(repr(marker)), \"ok\")\n",
         )
         withenv("GROUP" => "Core") do
             run_tests(; core = body)
@@ -395,7 +395,7 @@ end
                 "@testset \"A defines symbols\" begin\n" *
                 "    @test iso_method() == 18\n" *
                 "end\n" *
-                "write(raw\"$(a_ran)\", \"ok\")\n",
+                "write($(repr(a_ran)), \"ok\")\n",
         )
 
         # Group B references each of A's symbols; in an isolated module each lookup
@@ -409,7 +409,7 @@ end
                 "    @test (try; iso_global; catch e; e; end) isa UndefVarError\n" *
                 "    @test (try; iso_method(); catch e; e; end) isa UndefVarError\n" *
                 "end\n" *
-                "write(raw\"$(b_ran)\", \"ok\")\n",
+                "write($(repr(b_ran)), \"ok\")\n",
         )
 
         # Run A then B as two separate file groups via the umbrella expansion (each
@@ -459,7 +459,7 @@ end
             """
             handoff = get(ENV, "SUB_TEST_GROUP", "<unset>")
             rootvar = get(ENV, "GROUP", "<unset>")
-            open(raw"$(seen)", "w") do io
+            open($(repr(seen)), "w") do io
                 println(io, "handoff=", handoff)
                 println(io, "rootvar=", rootvar)
             end
@@ -504,7 +504,7 @@ end
             p = joinpath(root, "$(name).jl")
             write(
                 p,
-                "@testset \"$(name)\" begin\n    @test true\nend\nwrite(\"$(marker(name))\", \"1\")\n",
+                "@testset \"$(name)\" begin\n    @test true\nend\nwrite($(repr(marker(name))), \"1\")\n",
             )
             p
         end
@@ -578,7 +578,7 @@ end
             p = joinpath(root, "$(name).jl")
             write(
                 p,
-                "@testset \"$(name)\" begin\n    @test true\nend\nwrite(\"$(marker(name))\", \"1\")\n",
+                "@testset \"$(name)\" begin\n    @test true\nend\nwrite($(repr(marker(name))), \"1\")\n",
             )
             p
         end
@@ -799,7 +799,7 @@ end
         write(
             joinpath(qadir, "qa.jl"),
             "@testset \"qa\" begin\n  @test true\nend\n" *
-                "write(raw\"$(seen)\", Base.active_project())\n",
+                "write($(repr(seen)), Base.active_project())\n",
         )
         try
             withenv("GROUP" => "QA") do
@@ -975,7 +975,7 @@ end
         body = joinpath(root, "body.jl")
         write(
             body,
-            "@testset \"explicit core\" begin @test true end\nwrite(raw\"$(marker)\", \"1\")\n",
+            "@testset \"explicit core\" begin @test true end\nwrite($(repr(marker)), \"1\")\n",
         )
         withenv("GROUP" => "Core") do
             run_tests(; core = body)   # explicit core -> legacy mode, no folder discovery
@@ -987,7 +987,7 @@ end
         gbody = joinpath(root, "grp.jl")
         write(
             gbody,
-            "@testset \"g\" begin @test true end\nwrite(raw\"$(marker2)\", \"1\")\n",
+            "@testset \"g\" begin @test true end\nwrite($(repr(marker2)), \"1\")\n",
         )
         withenv("GROUP" => "G") do
             run_tests(; groups = Dict("G" => gbody))
