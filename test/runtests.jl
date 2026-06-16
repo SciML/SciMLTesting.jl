@@ -935,7 +935,7 @@ end
     end
 
     @testset "run_tests folder mode: missing / empty group folder errors" begin
-        # A declared group whose folder is MISSING is an error (mis-named group).
+        # A declared group whose folder is MISSING is an error (misnamed group).
         tdir = mktempdir()
         write(joinpath(tdir, "test_groups.toml"), "[Interface]\n")
         write(joinpath(tdir, "core.jl"), "@test true\n")

@@ -588,7 +588,7 @@ end
 #   * named group "X" -> test/X/  (exact, then case-insensitive)
 #   * "QA" -> test/qa/ (or test/QA/)
 #   * "All" -> Core + every group folder except QA and except in_all=false groups
-# A declared group whose folder is missing or empty is an ERROR (catches mis-named or
+# A declared group whose folder is missing or empty is an ERROR (catches misnamed or
 # empty groups). Each discovered file runs via the same isolated @safetestset path as
 # explicit mode (`_run_body`), labelled "<group>/<basename>", in sorted order.
 # ---------------------------------------------------------------------------
@@ -608,7 +608,7 @@ end
 
 # Run a named (non-Core, non-QA / or QA) group folder. Resolves the folder (exact
 # then case-insensitive), errors if it is MISSING or EMPTY (enforced coverage —
-# catches a declared-but-mis-named/empty group), activates a sub-env if the folder
+# catches a declared-but-misnamed/empty group), activates a sub-env if the folder
 # has its own Project.toml, then runs every *.jl file in sorted order. `default_parent`
 # is forwarded to `activate_group_env` for the sub-env develop step.
 function _run_group_folder(test_dir::AbstractString, name::AbstractString, default_parent)
@@ -721,7 +721,7 @@ The model:
     `parent`.
   * **Enforced coverage.** *Every* `*.jl` file in the selected group's folder runs —
     you cannot forget to register a test file. A declared group whose folder is
-    **missing or empty** is an **error** (catches a mis-named or empty group), as is an
+    **missing or empty** is an **error** (catches a misnamed or empty group), as is an
     empty `"Core"`. An unknown `GROUP` (not `All`/`Core`/`QA` and not declared) is also
     an error rather than a silent fall-through.
   * **Helpers / fixtures.** Only the *selected group's* folder is globbed, so any
