@@ -125,7 +125,7 @@ Guarantees specific to folder mode:
   * **Enforced coverage.** *Every* `*.jl` in the selected group's folder runs — you
     cannot forget to register a test file by leaving it out of an `include` list. A
     declared group whose folder is **missing or empty** is an **error** (catches a
-    mis-named or empty group), as is an empty `Core` and an unknown `GROUP`.
+    misnamed or empty group), as is an empty `Core` and an unknown `GROUP`.
   * **Sub-env per group.** If a group folder has its own `Project.toml` (e.g.
     `test/qa/Project.toml`), it is activated (`Pkg.activate` + develop the package by
     path + `instantiate`, with the `<1.11` `[sources]` backport) before its files

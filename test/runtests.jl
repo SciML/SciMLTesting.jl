@@ -807,8 +807,14 @@ end
             end
             @test isfile(seen)
             # The active project during the QA file run was the qa/ group env, and the
-            # repo-root package was developed into it.
-            @test read(seen, String) == joinpath(qadir, "Project.toml")
+            # repo-root package was developed into it. Compare with `samefile` rather
+            # than string equality: on case-insensitive filesystems (macOS, Windows)
+            # the group folder is resolved to the requested casing ("QA"), so the
+            # recorded `active_project()` differs textually from the lowercase on-disk
+            # `qadir` while pointing at the same directory.
+            active = read(seen, String)
+            @test basename(active) == "Project.toml"
+            @test samefile(dirname(active), qadir)
             envdeps = Pkg.TOML.parsefile(joinpath(qadir, "Project.toml"))
             @test haskey(get(envdeps, "deps", Dict()), "TinyQAPkg")
         finally
@@ -929,7 +935,7 @@ end
     end
 
     @testset "run_tests folder mode: missing / empty group folder errors" begin
-        # A declared group whose folder is MISSING is an error (mis-named group).
+        # A declared group whose folder is MISSING is an error (misnamed group).
         tdir = mktempdir()
         write(joinpath(tdir, "test_groups.toml"), "[Interface]\n")
         write(joinpath(tdir, "core.jl"), "@test true\n")
