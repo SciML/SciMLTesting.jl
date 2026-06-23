@@ -37,7 +37,8 @@ using Test: Test, @testset, @test
 using SafeTestsets: SafeTestsets, @safetestset
 
 export current_group, activate_group_env, run_qa, detect_sublibrary_group,
-    develop_sources!, run_tests, read_test_groups
+    develop_sources!, run_tests, read_test_groups,
+    with_clean_persistent_tasks_sources
 
 # Group names that are never sublibraries and never named functional groups: the
 # routing keywords `run_tests` and `detect_sublibrary_group` reserve.
@@ -348,8 +349,160 @@ function activate_group_env(
 end
 
 """
+    with_clean_persistent_tasks_sources(f; verbose = false)
+
+Run `f()` with every *installed* (depot) package's `[sources]` table temporarily
+purged of **broken path entries**, then restore every modified `Project.toml`
+verbatim (even if `f` throws). Returns whatever `f()` returns.
+
+This works around an upstream Pkg bug that breaks Aqua's persistent-tasks check on
+Julia >= 1.11. `Aqua.test_persistent_tasks` / `Aqua.find_persistent_tasks_deps`
+verify that loading a package (or each of its dependencies) does not spawn a
+persistent `Task` by `Pkg.develop`-ing the package **by its installed path** into a
+throwaway wrapper environment and precompiling it. On Julia >= 1.11, `Pkg.develop`
+honors a path-`[sources]` table baked into that installed `Project.toml`. Many
+registered SciML packages (e.g. `OptimizationBBO` 0.4.4-0.4.7 and most
+OrdinaryDiffEq / StochasticDiffEq / NonlinearSolve sublibraries) ship a leaked
+monorepo-relative `[sources]` such as
+
+```toml
+[sources]
+OptimizationBase = {path = "../OptimizationBase"}
+```
+
+In the registry-installed copy that sibling path does **not** exist
+(`.../packages/OptimizationBBO/<hash>/../OptimizationBase`), so `Pkg.develop` hard
+errors before the genuine check can run:
+
+```
+expected package `OptimizationBase [bca83a33]` to exist at path
+  `.../packages/OptimizationBBO/OptimizationBase`
+```
+
+honoring a `[sources]` entry for a package being *used as a dependency* is against
+Pkg's documented contract; the true fix is upstream in Pkg. Until that lands, this
+helper lets the SciML QA lane go green on Julia >= 1.11 **without weakening the
+check**: it removes only the spurious, unresolvable `[sources]` entries that Pkg
+should never have honored, so the genuine persistent-tasks precompile still runs and
+still fails on a real persistent task. A `[sources]` entry whose path *does* resolve
+is left untouched (it may be load-bearing), and a `[sources]` table is irrelevant to
+whether loading a package spawns a `Task`, so removing the broken entries cannot mask
+a genuine persistent task.
+
+The set of `Project.toml` files considered is taken from `Pkg.dependencies()` of the
+*active* environment (call after the QA env is activated/instantiated). Each file is
+made writable, rewritten with `TOML.print`, and on exit restored to its exact
+original bytes and original file mode. Files with no `[sources]`, or whose
+`[sources]` paths all resolve, are never touched.
+
+`verbose = true` logs each sanitized package and the removed source names via
+`@info`.
+
+# Examples
+
+```julia
+# Direct-call QA body (e.g. test/qa/qa.jl) that runs the persistent-tasks check:
+using SciMLTesting, Aqua, MyPackage
+with_clean_persistent_tasks_sources() do
+    Aqua.find_persistent_tasks_deps(MyPackage)
+end
+
+# Or wrap a full Aqua.test_all (run_qa does this for you by default):
+with_clean_persistent_tasks_sources() do
+    Aqua.test_all(MyPackage)
+end
+```
+
+See also [`run_qa`](@ref), which wraps its `Aqua.test_all` call in this helper by
+default (`clean_sources = true`).
+"""
+function with_clean_persistent_tasks_sources(f; verbose::Bool = false)
+    backups = _strip_broken_sources!(; verbose = verbose)
+    try
+        return f()
+    finally
+        _restore_sources!(backups)
+    end
+end
+
+# For every dep of the active environment whose installed Project.toml declares a
+# `[sources]` table with at least one *broken* path entry (a `path =` whose resolved
+# location does not exist), back up the file (bytes + mode) and rewrite it with only
+# the broken entries removed. Returns the backup table `path => (bytes, mode)` so the
+# files can be restored verbatim. A non-path source (url/rev) and a path source that
+# resolves are both left untouched. The active env is read via `Pkg.dependencies()`,
+# so call after the env is activated and instantiated.
+function _strip_broken_sources!(; verbose::Bool = false)
+    backups = Dict{String, Tuple{String, Union{UInt16, Nothing}}}()
+    for (_uuid, info) in Pkg.dependencies()
+        info.source === nothing && continue
+        project_file = _project_file(info.source)
+        project_file === nothing && continue
+        parsed = try
+            TOML.parsefile(project_file)
+        catch
+            continue                      # unreadable/odd project file: leave it alone
+        end
+        sources = get(parsed, "sources", nothing)
+        sources isa AbstractDict || continue
+        env_dir = dirname(project_file)
+        removed = String[]
+        for (name, spec) in collect(sources)   # collect: mutating while iterating
+            spec isa AbstractDict || continue
+            haskey(spec, "path") || continue    # url/rev git sources resolve identically
+            resolved = abspath(joinpath(env_dir, spec["path"]))
+            if !ispath(resolved)
+                delete!(sources, name)
+                push!(removed, name)
+            end
+        end
+        isempty(removed) && continue
+        original = read(project_file, String)
+        mode = try
+            filemode(project_file) % UInt16
+        catch
+            nothing
+        end
+        backups[project_file] = (original, mode)
+        isempty(sources) && delete!(parsed, "sources")
+        _make_writable(project_file)
+        open(project_file, "w") do io
+            TOML.print(io, parsed)
+        end
+        verbose && @info "SciMLTesting: stripped broken [sources]" package = info.name removed
+    end
+    return backups
+end
+
+function _restore_sources!(backups::AbstractDict)
+    for (project_file, (bytes, mode)) in backups
+        _make_writable(project_file)
+        open(project_file, "w") do io
+            write(io, bytes)
+        end
+        mode === nothing || (
+            try
+                chmod(project_file, mode)
+            catch
+            end
+        )
+    end
+    return nothing
+end
+
+# Ensure the owner can write `path` (installed depot copies are read-only). Best
+# effort: a chmod failure should not abort sanitize/restore.
+function _make_writable(path::AbstractString)
+    try
+        chmod(path, (filemode(path) | 0o200) % UInt16)
+    catch
+    end
+    return nothing
+end
+
+"""
     run_qa(pkg; Aqua = nothing, JET = nothing,
-           aqua = true, jet = false,
+           aqua = true, jet = false, clean_sources = true,
            aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
            testset = "Quality Assurance")
 
@@ -364,6 +517,19 @@ each repo's `test/qa/Project.toml` only, pass the already-loaded modules in as t
 
 `aqua` defaults to `true` and `jet` to `false` (JET's typo/type checks are
 opt-in per repo). The whole thing runs inside a `@testset` named `testset`.
+
+`clean_sources` (default `true`) wraps the `Aqua.test_all` call in
+[`with_clean_persistent_tasks_sources`](@ref), which strips *broken* path-`[sources]`
+entries from installed dependencies' `Project.toml` for the duration of the call (and
+restores them after). This works around an upstream Pkg >= 1.11 bug that otherwise
+makes Aqua's persistent-tasks check hard-error on any repo depending on a registered
+package that ships a leaked monorepo-relative `[sources]` (e.g. OptimizationBBO
+0.4.4-0.4.7, many OrdinaryDiffEq / StochasticDiffEq / NonlinearSolve sublibraries).
+The genuine persistent-tasks check still runs and can still fail on a real persistent
+task — only the spurious unresolvable `[sources]` Pkg should never have honored are
+removed. Set `clean_sources = false` to opt out (e.g. on Julia < 1.11, where the bug
+does not apply; the wrap is a cheap no-op there since no installed `[sources]` paths
+are broken in a single-package checkout, but the flag makes the intent explicit).
 
 This replaces the per-repo `qa.jl`/`jet.jl` bodies that all call
 `Aqua.test_all(pkg)` and `JET.test_package(pkg; target_modules = (pkg,), mode = :typo)`.
@@ -386,6 +552,7 @@ function run_qa(
         JET = nothing,
         aqua::Bool = true,
         jet::Bool = false,
+        clean_sources::Bool = true,
         aqua_kwargs = (;),
         jet_kwargs = (; target_modules = (pkg,), mode = :typo),
         testset::AbstractString = "Quality Assurance",
@@ -398,7 +565,10 @@ function run_qa(
     jet && JET === nothing &&
         throw(ArgumentError("run_qa: `jet = true` but no `JET` module was passed; call `run_qa(pkg; JET = JET, jet = true)`"))
     @testset "$testset" begin
-        aqua && Aqua.test_all(pkg; aqua_kwargs...)
+        if aqua
+            run_aqua = () -> Aqua.test_all(pkg; aqua_kwargs...)
+            clean_sources ? with_clean_persistent_tasks_sources(run_aqua) : run_aqua()
+        end
         jet && JET.test_package(pkg; jet_kwargs...)
     end
     return nothing
