@@ -337,14 +337,56 @@ function activate_group_env(
         develop_sources::Bool = true,
     )
     Pkg.activate(group_dir)
+    parents = parent isa AbstractString ? (parent,) : parent
+    # On Julia < 1.11 `[sources]` is ignored, so develop the parent(s) (the
+    # package(s) under test) AND the env's `[sources]` path graph in a *single*
+    # `Pkg.develop` call. Developing the parent alone would make Pkg resolve the
+    # parent's own `[deps]` against the registry; in a monorepo those deps are
+    # unregistered in-repo siblings reachable only via `[sources]`, so that
+    # resolution fails with "expected package <Sibling> to be registered". Adding
+    # every source path in the same call lets Pkg satisfy them all by path at
+    # once. Paths are deduplicated by package UUID because a `[sources]` entry
+    # may point at the same package as a `parent` (e.g. a QA env that lists the
+    # package under test in both), which `Pkg.develop` rejects as "multiple
+    # packages with the same UUID". On Julia >= 1.11 `[sources]` is honored
+    # natively, so only the parent(s) are developed (develop_sources! is a no-op).
     if develop
-        parents = parent isa AbstractString ? (parent,) : parent
-        specs = [Pkg.PackageSpec(path = abspath(p)) for p in parents]
+        paths = collect(AbstractString, parents)
+        if develop_sources && VERSION < v"1.11"
+            append!(paths, _collect_source_paths(group_dir))
+        end
+        specs = _dedup_path_specs(paths)
         isempty(specs) || Pkg.develop(specs)
+    elseif develop_sources
+        develop_sources!(group_dir; parent = parent)
     end
-    develop_sources && develop_sources!(group_dir; parent = parent)
     instantiate && Pkg.instantiate()
     return nothing
+end
+
+# Build `Pkg.develop` specs for a list of project directories, dropping duplicate
+# paths and any two paths that resolve to the same package UUID (Pkg.develop
+# errors on "multiple packages with the same UUID"). A path with no readable
+# Project.toml uuid is kept and deduplicated by its absolute path alone. The
+# first occurrence of each UUID/path wins, preserving caller order.
+function _dedup_path_specs(paths)
+    seen_uuid = Set{String}()
+    seen_path = Set{String}()
+    specs = Pkg.PackageSpec[]
+    for p in paths
+        ap = abspath(p)
+        ap in seen_path && continue
+        push!(seen_path, ap)
+        project_file = _project_file(ap)
+        uuid = project_file === nothing ? nothing :
+            get(TOML.parsefile(project_file), "uuid", nothing)
+        if uuid !== nothing
+            uuid in seen_uuid && continue
+            push!(seen_uuid, uuid)
+        end
+        push!(specs, Pkg.PackageSpec(path = ap))
+    end
+    return specs
 end
 
 """
