@@ -190,6 +190,83 @@ end
         @test_throws ArgumentError run_qa(SciMLTesting; aqua = false, jet = true)
     end
 
+    @testset "with_clean_persistent_tasks_sources" begin
+        # The bug: a *registry-installed* dependency's Project.toml ships a leaked
+        # path-`[sources]` whose sibling path does not exist in the depot, and Pkg
+        # >=1.11 hard-errors honoring it during Aqua's persistent-tasks `Pkg.develop`.
+        # Model that with a path-dev'd package whose ON-DISK Project.toml is given a
+        # `[sources]` with one BROKEN path entry (unresolvable, the leaked case) and
+        # one RESOLVING path entry. The sanitizer must, for the duration of the
+        # wrapped call, remove only the broken entry, leave the resolving one, and
+        # restore the file byte-for-byte (and mode) afterward — including on throw.
+        original_project = Base.active_project()
+        root = mktempdir()
+
+        # A real sibling the resolving [sources] entry points at.
+        good = joinpath(root, "GoodSib"); mkpath(joinpath(good, "src"))
+        write(
+            joinpath(good, "Project.toml"),
+            "name = \"GoodSib\"\nuuid = \"00000000-0000-0000-0000-0000000000cc\"\nversion = \"0.1.0\"\n"
+        )
+        write(joinpath(good, "src", "GoodSib.jl"), "module GoodSib\nend\n")
+
+        # The package under test. Develop it CLEAN (no [sources]) so the env
+        # activates on all Julia versions, then inject the leaked [sources] into its
+        # on-disk Project.toml afterward — mirroring how the bug manifests (the
+        # broken [sources] lives in the installed copy on disk, not in a resolved
+        # env we control). The sanitizer reads the dependency `source` dir from
+        # Pkg.dependencies(), exactly like Aqua's persistent-tasks check does.
+        pkg = joinpath(root, "PkgUT"); mkpath(joinpath(pkg, "src"))
+        write(
+            joinpath(pkg, "Project.toml"),
+            "name = \"PkgUT\"\nuuid = \"00000000-0000-0000-0000-0000000000dd\"\nversion = \"0.1.0\"\n"
+        )
+        write(joinpath(pkg, "src", "PkgUT.jl"), "module PkgUT\nend\n")
+
+        envd = joinpath(root, "env"); mkpath(envd)
+        try
+            Pkg.activate(envd)
+            Pkg.develop(Pkg.PackageSpec(path = pkg); io = devnull)
+
+            pkg_toml = joinpath(pkg, "Project.toml")
+            # Inject the leaked [sources] post-develop (the depot-copy scenario).
+            open(pkg_toml, "a") do io
+                println(io)
+                println(io, "[sources]")
+                println(io, "GoodSib = { path = \"../GoodSib\" }")
+                println(io, "Missing = { path = \"../DoesNotExist\" }")
+            end
+            before_bytes = read(pkg_toml, String)
+            before_mode = filemode(pkg_toml)
+
+            local saw_inside
+            ret = with_clean_persistent_tasks_sources() do
+                parsed = Pkg.TOML.parsefile(pkg_toml)
+                srcs = get(parsed, "sources", Dict{String, Any}())
+                # Broken "Missing" entry removed; resolving "GoodSib" entry kept.
+                saw_inside = (haskey(srcs, "GoodSib"), haskey(srcs, "Missing"))
+                42
+            end
+
+            # Return value passes through.
+            @test ret == 42
+            # During the call: broken stripped, resolving kept.
+            @test saw_inside == (true, false)
+            # After the call: file restored byte-for-byte and mode unchanged.
+            @test read(pkg_toml, String) == before_bytes
+            @test filemode(pkg_toml) == before_mode
+
+            # Restoration also happens when the wrapped body throws.
+            @test_throws ErrorException with_clean_persistent_tasks_sources() do
+                error("boom")
+            end
+            @test read(pkg_toml, String) == before_bytes
+            @test filemode(pkg_toml) == before_mode
+        finally
+            Pkg.activate(original_project)
+        end
+    end
+
     @testset "current_group empty normalization" begin
         # Empty ENV[env] is treated like unset (some CI matrices set GROUP="").
         withenv("GROUP" => "") do
