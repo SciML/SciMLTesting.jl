@@ -106,6 +106,77 @@ end
         end
     end
 
+    @testset "activate_group_env monorepo [sources] (Julia <1.11)" begin
+        # Regression (SciML/OptimalUncertaintyQuantification.jl QA lts): a monorepo
+        # root package depends on an unregistered in-repo sibling, and the group
+        # env lists BOTH the root and the sibling in [sources]. On Julia < 1.11,
+        # developing the root parent alone made Pkg resolve the root's [deps]
+        # (which include the sibling) against the registry and fail with
+        # "expected package <Sibling> to be registered". activate_group_env must
+        # develop the parent and the [sources] siblings together so every local
+        # package is satisfied by path.
+        original_project = Base.active_project()
+        repo = mktempdir()
+        # Sibling (unregistered, in-repo).
+        sib = joinpath(repo, "lib", "Sib"); mkpath(joinpath(sib, "src"))
+        write(
+            joinpath(sib, "Project.toml"),
+            "name = \"Sib\"\nuuid = \"00000000-0000-0000-0000-0000000000b1\"\nversion = \"0.1.0\"\n"
+        )
+        write(joinpath(sib, "src", "Sib.jl"), "module Sib\nend\n")
+        # Root package depends on the sibling and pins it via [sources].
+        write(
+            joinpath(repo, "Project.toml"),
+            "name = \"RootPkg\"\nuuid = \"00000000-0000-0000-0000-0000000000b2\"\nversion = \"0.1.0\"\n\n" *
+                "[deps]\nSib = \"00000000-0000-0000-0000-0000000000b1\"\n\n" *
+                "[sources]\nSib = { path = \"lib/Sib\" }\n"
+        )
+        mkdir(joinpath(repo, "src"))
+        write(joinpath(repo, "src", "RootPkg.jl"), "module RootPkg\nusing Sib\nend\n")
+        # QA group env lists the root AND the sibling in [sources] (the OUQ layout).
+        group_dir = joinpath(repo, "test", "qa"); mkpath(group_dir)
+        write(
+            joinpath(group_dir, "Project.toml"),
+            "[deps]\nRootPkg = \"00000000-0000-0000-0000-0000000000b2\"\n" *
+                "Sib = \"00000000-0000-0000-0000-0000000000b1\"\n\n" *
+                "[sources]\n" *
+                "RootPkg = { path = \"../..\" }\nSib = { path = \"../../lib/Sib\" }\n"
+        )
+
+        try
+            # Must not throw "expected package Sib to be registered" on 1.10, nor
+            # "multiple packages with the same UUID" (RootPkg is both a parent and a
+            # [sources] entry).
+            activate_group_env(group_dir)
+            @test Base.active_project() == joinpath(group_dir, "Project.toml")
+            if VERSION < v"1.11"
+                manifest = Pkg.TOML.parsefile(joinpath(group_dir, "Manifest.toml"))
+                entries = get(manifest, "deps", manifest)
+                @test get(entries["Sib"][1], "path", nothing) == abspath(sib)
+                @test get(entries["RootPkg"][1], "path", nothing) == abspath(repo)
+            end
+        finally
+            Pkg.activate(original_project)
+        end
+    end
+
+    @testset "_dedup_path_specs" begin
+        # Same UUID via two different paths -> first wins, second dropped.
+        root = mktempdir()
+        a = joinpath(root, "A"); mkpath(a)
+        alink = joinpath(root, "A2"); mkpath(alink)  # same uuid, different dir
+        write(joinpath(a, "Project.toml"), "name=\"A\"\nuuid=\"00000000-0000-0000-0000-0000000000c1\"\n")
+        write(joinpath(alink, "Project.toml"), "name=\"A\"\nuuid=\"00000000-0000-0000-0000-0000000000c1\"\n")
+        b = joinpath(root, "B"); mkpath(b)
+        write(joinpath(b, "Project.toml"), "name=\"B\"\nuuid=\"00000000-0000-0000-0000-0000000000c2\"\n")
+        # A path with no Project.toml uuid is kept (deduped by path only).
+        noproj = joinpath(root, "NoProj"); mkpath(noproj)
+
+        specs = SciMLTesting._dedup_path_specs([a, alink, b, noproj, b])
+        got = [s.path for s in specs]
+        @test got == [abspath(a), abspath(b), abspath(noproj)]
+    end
+
     @testset "run_qa" begin
         # Aqua-only (the default).
         run_qa(SciMLTesting; Aqua = FakeAqua)
