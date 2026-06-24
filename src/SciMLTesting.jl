@@ -36,7 +36,7 @@ using TOML: TOML
 using Test: Test, @testset, @test
 using SafeTestsets: SafeTestsets, @safetestset
 
-export current_group, activate_group_env, run_qa, detect_sublibrary_group,
+export current_group, activate_group_env, run_qa, run_explicit_imports, detect_sublibrary_group,
     develop_sources!, run_tests, read_test_groups,
     with_clean_persistent_tasks_sources
 
@@ -605,6 +605,12 @@ run_qa(MyPackage; Aqua = Aqua)
 # also run JET typo checks
 using Aqua, JET
 run_qa(MyPackage; Aqua = Aqua, JET = JET, jet = true)
+
+# also run ExplicitImports (standard + public-API) checks, curating a per-check
+# ignore-list for unavoidable non-public dependency accesses
+using ExplicitImports
+run_qa(MyPackage; Aqua = Aqua, ExplicitImports = ExplicitImports, explicit_imports = true,
+       ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_dep_name,))))
 ```
 """
 function run_qa(
@@ -616,6 +622,9 @@ function run_qa(
         clean_sources::Bool = true,
         aqua_kwargs = (;),
         jet_kwargs = (; target_modules = (pkg,), mode = :typo),
+        ExplicitImports = nothing,
+        explicit_imports::Bool = false,
+        ei_kwargs = (;),
         testset::AbstractString = "Quality Assurance",
     )
     # Validate before entering the @testset: a `throw` inside a testset is
@@ -625,12 +634,44 @@ function run_qa(
         throw(ArgumentError("run_qa: `aqua = true` but no `Aqua` module was passed; call `run_qa(pkg; Aqua = Aqua)`"))
     jet && JET === nothing &&
         throw(ArgumentError("run_qa: `jet = true` but no `JET` module was passed; call `run_qa(pkg; JET = JET, jet = true)`"))
+    explicit_imports && ExplicitImports === nothing &&
+        throw(ArgumentError("run_qa: `explicit_imports = true` but no `ExplicitImports` module was passed; call `run_qa(pkg; ExplicitImports = ExplicitImports, explicit_imports = true)`"))
     @testset "$testset" begin
         if aqua
             run_aqua = () -> Aqua.test_all(pkg; aqua_kwargs...)
             clean_sources ? with_clean_persistent_tasks_sources(run_aqua) : run_aqua()
         end
         jet && JET.test_package(pkg; jet_kwargs...)
+        explicit_imports && run_explicit_imports(pkg, ExplicitImports; ei_kwargs)
+    end
+    return nothing
+end
+
+"""
+    run_explicit_imports(pkg, ExplicitImports; ei_kwargs = (;))
+
+Run ExplicitImports.jl's standard checks (no-implicit-imports, no-stale-explicit-
+imports, all-explicit-imports-via-owners, all-qualified-accesses-via-owners) plus
+the public-API checks (all-qualified-accesses-are-public,
+all-explicit-imports-are-public) as a nested `@testset`. The `ExplicitImports`
+module is injected so `SciMLTesting` takes no hard dependency on it. `ei_kwargs`
+is a `NamedTuple` keyed by each check's short name (the part after `check_`); its
+value is that check's keyword arguments, so callers curate per-check ignore-lists,
+e.g. `ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:foo,)))`.
+"""
+function run_explicit_imports(pkg::Module, ExplicitImports; ei_kwargs = (;))
+    checks = (
+        :no_implicit_imports, :no_stale_explicit_imports,
+        :all_explicit_imports_via_owners, :all_qualified_accesses_via_owners,
+        :all_qualified_accesses_are_public, :all_explicit_imports_are_public,
+    )
+    @testset "ExplicitImports" begin
+        for name in checks
+            check = getproperty(ExplicitImports, Symbol("check_", name))
+            @testset "$(name)" begin
+                @test check(pkg; get(ei_kwargs, name, (;))...) === nothing
+            end
+        end
     end
     return nothing
 end

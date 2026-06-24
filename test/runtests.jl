@@ -21,6 +21,24 @@ module FakeJET
     end
 end
 
+# Stand-in ExplicitImports: the 6 checks run_qa/run_explicit_imports call. Each
+# returns `nothing` on success (matching ExplicitImports' API); the public check
+# also asserts it received the per-check ignore-list routed through `ei_kwargs`.
+module FakeExplicitImports
+    using Test: @test
+    import ..SciMLTesting
+    for f in (:check_no_implicit_imports, :check_no_stale_explicit_imports,
+            :check_all_explicit_imports_via_owners, :check_all_qualified_accesses_via_owners,
+            :check_all_explicit_imports_are_public)
+        @eval $f(pkg; kwargs...) = (@test pkg === SciMLTesting; nothing)
+    end
+    function check_all_qualified_accesses_are_public(pkg; ignore = (), kwargs...)
+        @test pkg === SciMLTesting
+        @test ignore == (:internal_thing,)
+        return nothing
+    end
+end
+
 @testset "SciMLTesting" begin
     @testset "current_group" begin
         # Default when unset.
@@ -185,9 +203,18 @@ end
         # JET-only.
         run_qa(SciMLTesting; JET = FakeJET, aqua = false, jet = true)
 
+        # Aqua + ExplicitImports (standard + public-API); per-check ignore-list routed via ei_kwargs.
+        run_qa(SciMLTesting; Aqua = FakeAqua, ExplicitImports = FakeExplicitImports,
+            explicit_imports = true,
+            ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))))
+        # The direct helper.
+        run_explicit_imports(SciMLTesting, FakeExplicitImports;
+            ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))))
+
         # Helpful errors when a requested tool was not supplied.
         @test_throws ArgumentError run_qa(SciMLTesting)
         @test_throws ArgumentError run_qa(SciMLTesting; aqua = false, jet = true)
+        @test_throws ArgumentError run_qa(SciMLTesting; aqua = false, explicit_imports = true)
     end
 
     @testset "with_clean_persistent_tasks_sources" begin
