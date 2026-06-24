@@ -249,28 +249,47 @@ end
 # developed dependency's own `[sources]`. Visiting each resolved path once handles
 # cycles and diamonds. This is version-independent (no `VERSION` gate) so the
 # resolution/recursion logic is unit-testable regardless of the running Julia.
+#
+# When recursing into an already-developed dependency, only `[sources]` that are
+# also that dependency's *runtime* `[deps]` are followed. A dependency's `[sources]`
+# table may contain entries that exist purely for that dependency's own test suite
+# (their names live in `[extras]`/`[targets].test`, not `[deps]`). Developing those
+# would inject phantom direct deps into the active environment, which then trips
+# Aqua's stale-deps / deps-compat checks (SciML/Optimization.jl#1228). The group env
+# itself (the root of the walk) is exempt: its `[sources]` legitimately pin the
+# package under test (and any siblings its own group needs).
 function _collect_source_paths(group_dir::AbstractString)
     visited = Set{String}()
     paths = String[]
-    _walk_sources!(paths, visited, abspath(group_dir))
+    root = abspath(group_dir)
+    _walk_sources!(paths, visited, root, root)
     return paths
 end
 
-function _walk_sources!(paths::Vector{String}, visited::Set{String}, project_dir::AbstractString)
+function _walk_sources!(
+        paths::Vector{String}, visited::Set{String},
+        project_dir::AbstractString, root::AbstractString,
+    )
     project_file = _project_file(project_dir)
     project_file === nothing && return nothing
     parsed = TOML.parsefile(project_file)
     sources = get(parsed, "sources", nothing)
     sources isa AbstractDict || return nothing
     env_dir = dirname(project_file)
-    for (_name, spec) in sources
+    isroot = abspath(project_dir) == root
+    runtimedeps = keys(get(parsed, "deps", Dict{String, Any}()))
+    for (name, spec) in sources
+        # For dependencies (not the group env at the root of the walk), skip
+        # [sources] that are not runtime deps -- those are the dep's test-only
+        # sources and must not leak into the active environment.
+        isroot || name in runtimedeps || continue
         spec isa AbstractDict || continue
         haskey(spec, "path") || continue       # leave url/rev git sources to Pkg
         resolved = abspath(joinpath(env_dir, spec["path"]))
         resolved in visited && continue
         push!(visited, resolved)
         push!(paths, resolved)
-        _walk_sources!(paths, visited, resolved)   # recurse into the dep's own [sources]
+        _walk_sources!(paths, visited, resolved, root)   # recurse into the dep's own [sources]
     end
     return nothing
 end

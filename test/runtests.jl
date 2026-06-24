@@ -216,11 +216,12 @@ end
         # declaring Project.toml's directory and recurse into that dep's own
         # [sources]. Tested version-independently via the path collector so the
         # resolution logic is exercised on Julia >= 1.11 too (where the public
-        # develop_sources! is a no-op).
+        # develop_sources! is a no-op). A's runtime source B is followed only
+        # because B is one of A's runtime [deps] (see the test-only-skip case below).
         root = mktempdir()
         # Layout:
         #   root/env/Project.toml   [sources] A -> ../A
-        #   root/A/Project.toml     [sources] B -> ../B   (relative to A, not env)
+        #   root/A/Project.toml     [deps] B; [sources] B -> ../B   (relative to A, not env)
         #   root/B/Project.toml     (no sources)
         envd = joinpath(root, "env"); mkpath(envd)
         a = joinpath(root, "A"); mkpath(a)
@@ -231,7 +232,8 @@ end
         )
         write(
             joinpath(a, "Project.toml"),
-            "name = \"A\"\nuuid = \"00000000-0000-0000-0000-000000000002\"\n\n[sources]\nB = { path = \"../B\" }\n"
+            "name = \"A\"\nuuid = \"00000000-0000-0000-0000-000000000002\"\n\n" *
+                "[deps]\nB = \"00000000-0000-0000-0000-000000000003\"\n\n[sources]\nB = { path = \"../B\" }\n"
         )
         write(
             joinpath(b, "Project.toml"),
@@ -240,6 +242,36 @@ end
 
         paths = SciMLTesting._collect_source_paths(envd)
         @test paths == [abspath(a), abspath(b)]
+
+        # Regression (SciML/Optimization.jl#1228, SciML/NeuralLyapunov.jl): a
+        # *non-root* dependency's test-only [sources] -- a source whose name is NOT
+        # one of that dependency's runtime [deps] -- must NOT be developed. Otherwise
+        # it leaks into the active env as a phantom direct dep and trips Aqua's
+        # stale-deps check. The root env's own [sources] are still followed.
+        troot = mktempdir()
+        tenv = joinpath(troot, "env"); mkpath(tenv)
+        tpkg = joinpath(troot, "Pkg"); mkpath(tpkg)
+        tlib = joinpath(troot, "Lib"); mkpath(tlib)
+        write(
+            joinpath(tenv, "Project.toml"),
+            "name = \"Env\"\nuuid = \"00000000-0000-0000-0000-0000000000e1\"\n\n[sources]\nPkg = { path = \"../Pkg\" }\n"
+        )
+        # Pkg lists Lib only in [extras]/[targets].test (a test-only dep), pinned via
+        # [sources] -- exactly the NeuralLyapunov ⇒ NeuralLyapunovProblemLibrary shape.
+        write(
+            joinpath(tpkg, "Project.toml"),
+            "name = \"Pkg\"\nuuid = \"00000000-0000-0000-0000-0000000000p1\"\n\n" *
+                "[extras]\nLib = \"00000000-0000-0000-0000-0000000000l1\"\n\n" *
+                "[sources]\nLib = { path = \"../Lib\" }\n\n" *
+                "[targets]\ntest = [\"Lib\"]\n"
+        )
+        write(
+            joinpath(tlib, "Project.toml"),
+            "name = \"Lib\"\nuuid = \"00000000-0000-0000-0000-0000000000l1\"\n"
+        )
+        tpaths = SciMLTesting._collect_source_paths(tenv)
+        @test tpaths == [abspath(tpkg)]               # Pkg developed
+        @test !(abspath(tlib) in tpaths)              # Lib (test-only) NOT developed
 
         # A url/rev (git) source is left to Pkg, not collected as a path.
         gitenv = mktempdir()
@@ -254,7 +286,8 @@ end
         write(joinpath(plainenv, "Project.toml"), "name = \"Plain\"\n")
         @test isempty(SciMLTesting._collect_source_paths(plainenv))
 
-        # A cycle (A -> B -> A) terminates and visits each path once.
+        # A cycle (A -> B -> A) terminates and visits each path once. The root A
+        # follows B; the non-root B follows A only because A is in B's [deps].
         croot = mktempdir()
         ca = joinpath(croot, "A"); mkpath(ca)
         cb = joinpath(croot, "B"); mkpath(cb)
@@ -264,7 +297,7 @@ end
         )
         write(
             joinpath(cb, "Project.toml"),
-            "[sources]\nA = { path = \"../A\" }\n"
+            "[deps]\nA = \"00000000-0000-0000-0000-0000000000a1\"\n\n[sources]\nA = { path = \"../A\" }\n"
         )
         cpaths = SciMLTesting._collect_source_paths(ca)
         @test sort(cpaths) == sort([abspath(cb), abspath(ca)])
