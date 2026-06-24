@@ -15,9 +15,12 @@ few calls — or a single declarative [`run_tests`](#the-run_tests-dispatcher) c
 instead of copy-pasted setup.
 
 The package depends only on the standard libraries `Pkg`, `TOML`, and `Test`. It is
-intentionally **light**: it does not depend on Aqua or JET. The `run_qa` helper takes
-the already-loaded `Aqua`/`JET` modules as keyword arguments, so those heavier tools
-stay in each repo's `test/qa/Project.toml` and never enter `SciMLTesting`'s graph.
+intentionally **light**: it takes no hard dependency on Aqua, JET, or
+ExplicitImports. Each of those tools is wired in through a package extension, so the
+heavier tools stay in each repo's `test/qa/Project.toml` and never enter
+`SciMLTesting`'s graph. In a `qa.jl`, simply `using Aqua, JET, ExplicitImports` and
+the extensions auto-register the loaded modules; `run_qa` then runs whichever tools
+are loaded — no need to thread the modules in as keyword arguments.
 
 ## Installation
 
@@ -45,7 +48,7 @@ test = ["Test", "SciMLTesting", ...]
 | `current_group(; env = "GROUP", default = "All")` | Read the test-group env var, defaulting to `"All"` (empty string also normalizes to the default). |
 | `activate_group_env(group_dir; parent, develop, instantiate, develop_sources)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. |
 | `develop_sources!(group_dir; parent)` | On Julia < 1.11, `Pkg.develop` the env's `[sources]` path graph (recursively); a no-op on 1.11+. |
-| `run_qa(pkg; Aqua, JET, aqua, jet, ...)` | Run the standard Aqua/JET QA body, taking the loaded modules as kwargs. |
+| `run_qa(pkg; Aqua, JET, ExplicitImports, aqua, jet, explicit_imports, ...)` | Run the standard Aqua/JET/ExplicitImports QA body. Auto-detects loaded tools via package extensions: `using` a tool is enough; each loaded tool's enable flag defaults on. |
 | `detect_sublibrary_group(group, lib_dir; default_group = "Core")` | Map a `GROUP` value to a `(sublibrary, test_group)` pair for a monorepo. |
 
 All are documented with full docstrings; `?run_tests` etc. at the REPL.
@@ -174,9 +177,8 @@ run_tests(;
 and `test/qa/qa.jl`:
 
 ```julia
-using MyPackage, Aqua
-using SciMLTesting
-run_qa(MyPackage; Aqua = Aqua)
+using SciMLTesting, Aqua, MyPackage
+run_qa(MyPackage)
 ```
 
 Key guarantees:
@@ -292,10 +294,12 @@ end
 and `test/qa/qa.jl`:
 
 ```julia
-using MyPackage, Aqua, JET
-using SciMLTesting
+using SciMLTesting, Aqua, JET, ExplicitImports, MyPackage
 
-run_qa(MyPackage; Aqua = Aqua, JET = JET, jet = true)
+# `using` the tools is enough: the extensions auto-register them and each loaded
+# tool's enable flag defaults on. The per-repo qa.jl collapses to only the
+# genuinely-per-repo kwargs (the ExplicitImports per-check ignore-lists).
+run_qa(MyPackage; ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_dep_name,))))
 ```
 
 ### A monorepo root `test/runtests.jl` (manual helpers)

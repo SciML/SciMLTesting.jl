@@ -1,6 +1,12 @@
 using SciMLTesting
 using Test
 using Pkg
+# `using` the real tools triggers SciMLTesting's package extensions, which
+# auto-register each module with SciMLTesting (see the "QA tool auto-detection"
+# testset). They must be available in the test env for the extensions to load.
+using Aqua
+using JET
+using ExplicitImports
 
 # Stand-in modules so the test exercises run_qa without a hard dependency on
 # Aqua/JET: they only need to expose the methods run_qa calls. Modules must be
@@ -195,26 +201,70 @@ end
         @test got == [abspath(a), abspath(b), abspath(noproj)]
     end
 
-    @testset "run_qa" begin
-        # Aqua-only (the default).
-        run_qa(SciMLTesting; Aqua = FakeAqua)
+    @testset "QA tool auto-detection (extensions registered)" begin
+        # `using Aqua, JET, ExplicitImports` at the top of this file loaded the
+        # three SciMLTesting extensions; each extension's `__init__` registered the
+        # real module. Assert the registry now points at the genuine modules.
+        @test SciMLTesting._qa_tool(:Aqua) === Aqua
+        @test SciMLTesting._qa_tool(:JET) === JET
+        @test SciMLTesting._qa_tool(:ExplicitImports) === ExplicitImports
+        # An unregistered tool name returns `nothing`.
+        @test SciMLTesting._qa_tool(:NotATool) === nothing
+    end
+
+    @testset "run_qa explicit-module path" begin
+        # Explicit module args win over the auto-detected registry, so these
+        # exercise the run-logic against the Fake stand-ins regardless of whether
+        # the real tools are loaded in the test env. `aqua`/`jet`/`explicit_imports`
+        # default to "module !== nothing", so passing a Fake module turns it on.
+
+        # Aqua-only.
+        run_qa(SciMLTesting; Aqua = FakeAqua, JET = nothing, ExplicitImports = nothing)
         # Aqua + JET.
-        run_qa(SciMLTesting; Aqua = FakeAqua, JET = FakeJET, jet = true)
-        # JET-only.
-        run_qa(SciMLTesting; JET = FakeJET, aqua = false, jet = true)
+        run_qa(SciMLTesting; Aqua = FakeAqua, JET = FakeJET, ExplicitImports = nothing)
+        # JET-only (Aqua off even though a module is registered).
+        run_qa(SciMLTesting; Aqua = nothing, JET = FakeJET, ExplicitImports = nothing)
 
         # Aqua + ExplicitImports (standard + public-API); per-check ignore-list routed via ei_kwargs.
-        run_qa(SciMLTesting; Aqua = FakeAqua, ExplicitImports = FakeExplicitImports,
-            explicit_imports = true,
+        run_qa(SciMLTesting; Aqua = FakeAqua, JET = nothing, ExplicitImports = FakeExplicitImports,
             ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))))
         # The direct helper.
         run_explicit_imports(SciMLTesting, FakeExplicitImports;
             ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))))
 
-        # Helpful errors when a requested tool was not supplied.
-        @test_throws ArgumentError run_qa(SciMLTesting)
-        @test_throws ArgumentError run_qa(SciMLTesting; aqua = false, jet = true)
-        @test_throws ArgumentError run_qa(SciMLTesting; aqua = false, explicit_imports = true)
+        # Backward-compat: old explicit `Aqua = Aqua, jet = true` form behaves identically.
+        run_qa(SciMLTesting; Aqua = FakeAqua, JET = FakeJET, jet = true,
+            ExplicitImports = nothing)
+
+        # Helpful errors when an enable flag is forced on but the module is unavailable.
+        @test_throws ArgumentError run_qa(SciMLTesting; Aqua = nothing, aqua = true,
+            JET = nothing, ExplicitImports = nothing)
+        @test_throws ArgumentError run_qa(SciMLTesting; Aqua = nothing, JET = nothing,
+            jet = true, ExplicitImports = nothing)
+        @test_throws ArgumentError run_qa(SciMLTesting; Aqua = nothing, JET = nothing,
+            ExplicitImports = nothing, explicit_imports = true)
+    end
+
+    @testset "run_qa enable-flag defaulting from registry" begin
+        # A registered tool defaults its enable flag on; an unregistered tool
+        # defaults it off. Drive this through the public registry by registering
+        # a Fake module, then checking `run_qa` (with all other tools forced off)
+        # picks it up with no module/flag kwargs.
+        saved = copy(SciMLTesting._QA_MODULES)
+        try
+            empty!(SciMLTesting._QA_MODULES)
+            # Nothing registered: all flags default off, so run_qa is a no-op (no error).
+            run_qa(SciMLTesting)
+
+            # Register a Fake Aqua: `aqua` now defaults on and run_qa runs it.
+            SciMLTesting._register_qa_tool!(:Aqua, FakeAqua)
+            @test SciMLTesting._qa_tool(:Aqua) === FakeAqua
+            run_qa(SciMLTesting)                 # runs FakeAqua via the registry default
+            run_qa(SciMLTesting; aqua = false)   # explicit off skips it (no error)
+        finally
+            empty!(SciMLTesting._QA_MODULES)
+            merge!(SciMLTesting._QA_MODULES, saved)
+        end
     end
 
     @testset "with_clean_persistent_tasks_sources" begin
