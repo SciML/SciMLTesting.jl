@@ -22,12 +22,15 @@ setup. The top-level [`run_tests`](@ref) dispatcher owns the whole `runtests.jl`
 control flow, so a repo replaces its hand-written `if GROUP == ...` ladder with a
 single declarative call.
 
-It deliberately stays light, depending only on the standard libraries `Pkg`,
-`TOML`, and `Test` plus the tiny `SafeTestsets` package (whose `@safetestset` macro
-runs each file-path group body in its own isolated module). The QA helper accepts
-the already-loaded `Aqua`/`JET` modules as keyword arguments so that those heavier
-tools stay in each repo's `test/qa/Project.toml` and never enter `SciMLTesting`'s
-own dependency graph.
+It stays light: beyond the standard libraries `Pkg`, `TOML`, and `Test` and the
+tiny `SafeTestsets` package (whose `@safetestset` macro runs each file-path group
+body in its own isolated module), it depends only on the lightweight, broad-compat
+QA tools `Aqua` and `ExplicitImports`, so [`run_qa`](@ref) runs them without the
+caller threading the modules in or even listing them as test dependencies. The
+heavier, compiler-version-pinned `JET` is kept a *weak* dependency (loaded via a
+package extension) so it can never constrain or break `SciMLTesting`'s own load on a
+Julia version JET does not yet support: `using JET` in a repo's `test/qa/qa.jl`
+auto-registers it and turns the JET check on.
 """
 module SciMLTesting
 
@@ -35,6 +38,8 @@ using Pkg: Pkg
 using TOML: TOML
 using Test: Test, @testset, @test
 using SafeTestsets: SafeTestsets, @safetestset
+using Aqua: Aqua
+using ExplicitImports: ExplicitImports
 
 export current_group, activate_group_env, run_qa, run_explicit_imports, detect_sublibrary_group,
     develop_sources!, run_tests, read_test_groups,
@@ -43,6 +48,15 @@ export current_group, activate_group_env, run_qa, run_explicit_imports, detect_s
 # Group names that are never sublibraries and never named functional groups: the
 # routing keywords `run_tests` and `detect_sublibrary_group` reserve.
 const RESERVED_GROUPS = ("All", "Core", "QA")
+
+# Registry of optional (weakdep) QA tool modules, populated by a package extension
+# in `__init__` when the user `using`s the tool. Only `JET` is registered this way;
+# `Aqua` and `ExplicitImports` are direct deps and always available, so they need no
+# registry. `run_qa` reads `_qa_tool(:JET)`, so `using JET` is enough to turn the JET
+# check on. Internal, not exported; the extension calls `_register_qa_tool!`.
+const _QA_MODULES = Dict{Symbol, Module}()
+_register_qa_tool!(name::Symbol, mod::Module) = (_QA_MODULES[name] = mod; nothing)
+_qa_tool(name::Symbol) = get(_QA_MODULES, name, nothing)
 
 """
     read_test_groups(test_dir) -> Dict{String, Dict{String, Any}}
@@ -562,22 +576,39 @@ function _make_writable(path::AbstractString)
 end
 
 """
-    run_qa(pkg; Aqua = nothing, JET = nothing,
-           aqua = true, jet = false, clean_sources = true,
+    run_qa(pkg; Aqua = Aqua, JET = ..., ExplicitImports = ExplicitImports,
+           aqua = Aqua !== nothing, jet = JET !== nothing,
+           explicit_imports = false,
+           clean_sources = true,
            aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
-           testset = "Quality Assurance")
+           ei_kwargs = (;), testset = "Quality Assurance")
 
 Run the standard SciML quality-assurance body for module `pkg`.
 
-`SciMLTesting` intentionally does not depend on Aqua or JET. To keep those tools in
-each repo's `test/qa/Project.toml` only, pass the already-loaded modules in as the
-`Aqua` and `JET` keyword arguments; whichever is supplied (and enabled) is run:
+`Aqua` and `ExplicitImports` are direct (lightweight, broad-compat) dependencies of
+`SciMLTesting`, so `run_qa` always has them — you do not pass them, `using` them, or
+list them as test dependencies. `JET` is the exception: it is compiler-version-pinned
+and so is kept a *weak* dependency, loaded only on demand. `using JET` in your
+`test/qa/qa.jl` triggers `SciMLTesting`'s JET extension, which auto-registers the
+module; `run_qa` then picks it up. The typical call collapses to just
+`run_qa(MyPkg; explicit_imports = true, ei_kwargs = ...)`.
 
-  * `Aqua` + `aqua = true` ⇒ `Aqua.test_all(pkg; aqua_kwargs...)`,
-  * `JET` + `jet = true` ⇒ `JET.test_package(pkg; jet_kwargs...)`.
+Each tool runs if it is both available and enabled:
 
-`aqua` defaults to `true` and `jet` to `false` (JET's typo/type checks are
-opt-in per repo). The whole thing runs inside a `@testset` named `testset`.
+  * `Aqua` + `aqua` ⇒ `Aqua.test_all(pkg; aqua_kwargs...)`,
+  * `JET` + `jet` ⇒ `JET.test_package(pkg; jet_kwargs...)`,
+  * `ExplicitImports` + `explicit_imports` ⇒ ExplicitImports' standard + public-API
+    checks (see [`run_explicit_imports`](@ref)).
+
+Enable-flag defaults: `aqua` defaults to `Aqua !== nothing` (on — Aqua is always
+available; pass `Aqua = nothing` or `aqua = false` to skip it), and `jet` defaults to
+`JET !== nothing` (on exactly when `JET` has been loaded/registered). `explicit_imports`
+defaults to **`false`** — a deliberate opt-in: because `ExplicitImports` is always
+available, defaulting it on would silently turn the (per-repo-curated) ExplicitImports
+checks on for every existing `run_qa` caller on a routine version bump, so a repo must
+ask for them with `explicit_imports = true`. Setting an enable flag `true` while its
+module is unavailable is a configuration error and throws an `ArgumentError`. The whole
+thing runs inside a `@testset` named `testset`.
 
 `clean_sources` (default `true`) wraps the `Aqua.test_all` call in
 [`with_clean_persistent_tasks_sources`](@ref), which strips *broken* path-`[sources]`
@@ -598,32 +629,37 @@ This replaces the per-repo `qa.jl`/`jet.jl` bodies that all call
 # Examples
 
 ```julia
-# in test/qa/qa.jl, after `using Aqua, MyPackage`
-using SciMLTesting
-run_qa(MyPackage; Aqua = Aqua)
+# in test/qa/qa.jl: Aqua + ExplicitImports come from SciMLTesting's own deps, so the
+# per-repo qa.jl collapses to `explicit_imports = true` plus the genuinely per-repo
+# kwargs (the ignore-lists). Aqua + ExplicitImports both run here:
+using SciMLTesting, MyPackage
+run_qa(MyPackage; explicit_imports = true,
+    ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_dep_name,))))
 
-# also run JET typo checks
-using Aqua, JET
+# Add the JET check by `using JET` (its weakdep extension auto-registers it):
+using SciMLTesting, JET, MyPackage
+run_qa(MyPackage; explicit_imports = true)
+
+# Aqua only — leave `explicit_imports` at its default and don't load JET:
+using SciMLTesting, MyPackage
+run_qa(MyPackage)
+
+# Explicitly threading the modules in still works (backward-compatible):
+using SciMLTesting, Aqua, JET
 run_qa(MyPackage; Aqua = Aqua, JET = JET, jet = true)
-
-# also run ExplicitImports (standard + public-API) checks, curating a per-check
-# ignore-list for unavoidable non-public dependency accesses
-using ExplicitImports
-run_qa(MyPackage; Aqua = Aqua, ExplicitImports = ExplicitImports, explicit_imports = true,
-       ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_dep_name,))))
 ```
 """
 function run_qa(
         pkg::Module;
-        Aqua = nothing,
-        JET = nothing,
-        aqua::Bool = true,
-        jet::Bool = false,
+        Aqua = Aqua,
+        JET = _qa_tool(:JET),
+        ExplicitImports = ExplicitImports,
+        aqua::Bool = Aqua !== nothing,
+        jet::Bool = JET !== nothing,
+        explicit_imports::Bool = false,
         clean_sources::Bool = true,
         aqua_kwargs = (;),
         jet_kwargs = (; target_modules = (pkg,), mode = :typo),
-        ExplicitImports = nothing,
-        explicit_imports::Bool = false,
         ei_kwargs = (;),
         testset::AbstractString = "Quality Assurance",
     )
@@ -631,11 +667,11 @@ function run_qa(
     # recorded as an errored test result rather than propagating, which would
     # make these misconfiguration errors impossible to `@test_throws`-catch.
     aqua && Aqua === nothing &&
-        throw(ArgumentError("run_qa: `aqua = true` but no `Aqua` module was passed; call `run_qa(pkg; Aqua = Aqua)`"))
+        throw(ArgumentError("run_qa: `aqua = true` but the `Aqua` module is `nothing`; Aqua is a SciMLTesting dependency, so omit the `Aqua` keyword (or pass `aqua = false` to skip it)"))
     jet && JET === nothing &&
-        throw(ArgumentError("run_qa: `jet = true` but no `JET` module was passed; call `run_qa(pkg; JET = JET, jet = true)`"))
+        throw(ArgumentError("run_qa: `jet = true` but the `JET` module is unavailable; `using JET` (its weakdep extension auto-registers it) or pass `run_qa(pkg; JET = JET, jet = true)`"))
     explicit_imports && ExplicitImports === nothing &&
-        throw(ArgumentError("run_qa: `explicit_imports = true` but no `ExplicitImports` module was passed; call `run_qa(pkg; ExplicitImports = ExplicitImports, explicit_imports = true)`"))
+        throw(ArgumentError("run_qa: `explicit_imports = true` but the `ExplicitImports` module is `nothing`; ExplicitImports is a SciMLTesting dependency, so omit the `ExplicitImports` keyword (or pass `explicit_imports = false` to skip it)"))
     @testset "$testset" begin
         if aqua
             run_aqua = () -> Aqua.test_all(pkg; aqua_kwargs...)
@@ -654,7 +690,8 @@ Run ExplicitImports.jl's standard checks (no-implicit-imports, no-stale-explicit
 imports, all-explicit-imports-via-owners, all-qualified-accesses-via-owners) plus
 the public-API checks (all-qualified-accesses-are-public,
 all-explicit-imports-are-public) as a nested `@testset`. The `ExplicitImports`
-module is injected so `SciMLTesting` takes no hard dependency on it. `ei_kwargs`
+module is taken as an argument (`run_qa` passes its own `ExplicitImports` dependency)
+so this helper stays usable with any compatible module. `ei_kwargs`
 is a `NamedTuple` keyed by each check's short name (the part after `check_`); its
 value is that check's keyword arguments, so callers curate per-check ignore-lists,
 e.g. `ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:foo,)))`.
@@ -1019,9 +1056,10 @@ behavior is unchanged from v1.1.x.
     as part of `"All"`; see `all` to curate this.
   * `qa` — the QA group body, run for the `"QA"` group (and, by default, as part of
     `"All"`). Accepts the same shapes as a `groups` value. A convenient form is a
-    `NamedTuple`/`Dict` carrying the package and Aqua/JET handles plus a thunk that
-    calls [`run_qa`](@ref), e.g. `qa = (; env = "qa", body = () -> run_qa(MyPkg;
-    Aqua = Aqua))`.
+    thunk that calls [`run_qa`](@ref): Aqua and ExplicitImports come from
+    `SciMLTesting`'s own deps, so `qa = () -> run_qa(MyPkg; explicit_imports = true)`
+    (add `using JET` in the body, or a `qa` sub-`env` that provides JET, to also run
+    the JET check).
   * `env`, `default` — forwarded to [`current_group`](@ref) to read and normalize
     the selected group (empty string and unset both normalize to `default`). `env`
     is the variable the *root* dispatcher reads to learn which group was requested.
@@ -1129,8 +1167,8 @@ using SciMLTesting
 run_tests(;
     core = joinpath(@__DIR__, "core_tests.jl"),
     qa = (; env = "qa", body = () -> begin
-        using MyPackage, Aqua
-        run_qa(MyPackage; Aqua = Aqua)
+        using Aqua, MyPackage
+        run_qa(MyPackage)
     end),
 )
 

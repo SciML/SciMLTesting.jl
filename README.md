@@ -14,10 +14,14 @@ documented helpers so each repo's `runtests.jl` becomes `using SciMLTesting` plu
 few calls — or a single declarative [`run_tests`](#the-run_tests-dispatcher) call —
 instead of copy-pasted setup.
 
-The package depends only on the standard libraries `Pkg`, `TOML`, and `Test`. It is
-intentionally **light**: it does not depend on Aqua or JET. The `run_qa` helper takes
-the already-loaded `Aqua`/`JET` modules as keyword arguments, so those heavier tools
-stay in each repo's `test/qa/Project.toml` and never enter `SciMLTesting`'s graph.
+Beyond the standard libraries `Pkg`, `TOML`, and `Test` (and the tiny
+`SafeTestsets`), it depends only on the lightweight, broad-compat QA tools **Aqua**
+and **ExplicitImports** — so `run_qa` always has them and your `qa.jl` neither
+`using`s them nor lists them as test dependencies. The heavier,
+compiler-version-pinned **JET** is kept a *weak* dependency (loaded via a package
+extension) so it can never constrain or break `SciMLTesting`'s own load on a Julia
+version JET doesn't yet support: add `using JET` in your `qa.jl` and its extension
+auto-registers it, turning the JET check on.
 
 ## Installation
 
@@ -45,7 +49,7 @@ test = ["Test", "SciMLTesting", ...]
 | `current_group(; env = "GROUP", default = "All")` | Read the test-group env var, defaulting to `"All"` (empty string also normalizes to the default). |
 | `activate_group_env(group_dir; parent, develop, instantiate, develop_sources)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. |
 | `develop_sources!(group_dir; parent)` | On Julia < 1.11, `Pkg.develop` the env's `[sources]` path graph (recursively); a no-op on 1.11+. |
-| `run_qa(pkg; Aqua, JET, aqua, jet, ...)` | Run the standard Aqua/JET QA body, taking the loaded modules as kwargs. |
+| `run_qa(pkg; Aqua, JET, ExplicitImports, aqua, jet, explicit_imports, ...)` | Run the standard Aqua/JET/ExplicitImports QA body. Aqua + ExplicitImports come from SciMLTesting's deps (always available; `aqua` on by default, `explicit_imports` opt-in); `using JET` registers JET via its weakdep extension and turns the JET check on. |
 | `detect_sublibrary_group(group, lib_dir; default_group = "Core")` | Map a `GROUP` value to a `(sublibrary, test_group)` pair for a monorepo. |
 
 All are documented with full docstrings; `?run_tests` etc. at the REPL.
@@ -174,9 +178,8 @@ run_tests(;
 and `test/qa/qa.jl`:
 
 ```julia
-using MyPackage, Aqua
-using SciMLTesting
-run_qa(MyPackage; Aqua = Aqua)
+using SciMLTesting, MyPackage
+run_qa(MyPackage; explicit_imports = true)
 ```
 
 Key guarantees:
@@ -292,10 +295,13 @@ end
 and `test/qa/qa.jl`:
 
 ```julia
-using MyPackage, Aqua, JET
-using SciMLTesting
+using SciMLTesting, JET, MyPackage
 
-run_qa(MyPackage; Aqua = Aqua, JET = JET, jet = true)
+# Aqua + ExplicitImports come from SciMLTesting's deps; `using JET` turns the JET
+# check on. The per-repo qa.jl collapses to `explicit_imports = true` plus the
+# genuinely-per-repo kwargs (the ExplicitImports per-check ignore-lists).
+run_qa(MyPackage; explicit_imports = true,
+    ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_dep_name,))))
 ```
 
 ### A monorepo root `test/runtests.jl` (manual helpers)
