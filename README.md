@@ -49,7 +49,7 @@ test = ["Test", "SciMLTesting", ...]
 | `current_group(; env = "GROUP", default = "All")` | Read the test-group env var, defaulting to `"All"` (empty string also normalizes to the default). |
 | `activate_group_env(group_dir; parent, develop, instantiate, develop_sources)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. |
 | `develop_sources!(group_dir; parent)` | On Julia < 1.11, `Pkg.develop` the env's `[sources]` path graph (recursively); a no-op on 1.11+. |
-| `run_qa(pkg; Aqua, JET, ExplicitImports, aqua, jet, explicit_imports, ...)` | Run the standard Aqua/JET/ExplicitImports QA body. Aqua + ExplicitImports come from SciMLTesting's deps (always available; `aqua` on by default, `explicit_imports` opt-in); `using JET` registers JET via its weakdep extension and turns the JET check on. |
+| `run_qa(pkg; Aqua, JET, ExplicitImports, aqua, jet, explicit_imports, aqua_broken, jet_broken, ei_broken, ...)` | Run the standard Aqua/JET/ExplicitImports QA body. Aqua + ExplicitImports come from SciMLTesting's deps (always available; `aqua` on by default, `explicit_imports` opt-in); `using JET` registers JET via its weakdep extension and turns the JET check on. The `*_broken` kwargs mark known-broken findings as `@test_broken` (see [Known-broken findings](#known-broken-findings-aqua_broken-jet_broken-ei_broken)). |
 | `detect_sublibrary_group(group, lib_dir; default_group = "Core")` | Map a `GROUP` value to a `(sublibrary, test_group)` pair for a monorepo. |
 
 All are documented with full docstrings; `?run_tests` etc. at the REPL.
@@ -303,6 +303,45 @@ using SciMLTesting, JET, MyPackage
 run_qa(MyPackage; explicit_imports = true,
     ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_dep_name,))))
 ```
+
+### Known-broken findings (`aqua_broken`, `jet_broken`, `ei_broken`)
+
+When converting a hand-rolled `qa.jl` to `run_qa` would otherwise re-red a repo that
+has a *known* Aqua/JET/ExplicitImports finding tracked in a GitHub issue (today
+expressed as `@test_broken`), three `run_qa` kwargs preserve those suppressions so the
+QA lane records `Broken` rather than `Fail`. All default to empty/`false`, so omitting
+them is exactly the pre-1.6 behavior.
+
+```julia
+using SciMLTesting, JET, MyPackage
+run_qa(MyPackage; explicit_imports = true,
+    aqua_broken = (:ambiguities,),         # disable + placeholder for a tracked Aqua sub-check
+    jet_broken = true,                     # report_package + @test_broken isempty(reports)
+    ei_broken = (:no_implicit_imports,))   # route this EI check through @test_broken
+```
+
+  * **`aqua_broken`** — a collection of `Aqua.test_all` sub-check names (`:ambiguities`,
+    `:unbound_args`, `:undefined_exports`, `:project_extras`, `:stale_deps`,
+    `:deps_compat`, `:piracies`, `:persistent_tasks`). Each named sub-check is
+    **disabled** in the `Aqua.test_all` call (the broken-disable wins over any
+    `aqua_kwargs` entry) and gets one `@test_broken false` in a nested
+    `@testset "aqua: <name> (broken)"`. This is a **tracked placeholder, not an
+    auto-detector**: a fixed sub-check is not flagged automatically — remove the name
+    when the issue closes. (Reliable per-sub-check auto-flagging is not robust across
+    Aqua versions, so this mirrors the fleet's existing `<check> = false` +
+    `@test_broken` pattern.)
+  * **`jet_broken::Bool`** — when the JET check runs, replaces the hard
+    `JET.test_package` with `rep = JET.report_package(pkg; ...)` and
+    `@test_broken isempty(JET.get_reports(rep))`. This **auto-flags**: once JET is clean
+    the `@test_broken` becomes an `Unexpected Pass` (an `Error`), prompting you to drop
+    `jet_broken`. `report_package` is report-only, so a `mode` key in `jet_kwargs` (a
+    `test_package`-only pass/fail config) is dropped for the report call; the JET config
+    keys `report_package` honors (`target_modules`, `target_defined_modules`,
+    `ignored_modules`, ...) pass through unchanged.
+  * **`ei_broken`** — a collection of ExplicitImports check short-names (the part after
+    `check_`, e.g. `:no_implicit_imports`, `:all_explicit_imports_are_public`). A named
+    check runs as `@test_broken check(pkg; ...) === nothing`. This **auto-flags** like
+    `jet_broken`: once the check passes, the `@test_broken` becomes an `Unexpected Pass`.
 
 ### A monorepo root `test/runtests.jl` (manual helpers)
 

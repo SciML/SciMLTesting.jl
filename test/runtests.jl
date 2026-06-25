@@ -13,7 +13,14 @@ using JET
 module FakeAqua
     using Test: @test
     import ..SciMLTesting
-    test_all(pkg; kwargs...) = (@test pkg === SciMLTesting; true)
+    # Record the keyword arguments the most recent test_all call received so a test
+    # can assert that a known-broken sub-check was disabled in the call.
+    const LAST_KWARGS = Ref{Any}(nothing)
+    function test_all(pkg; kwargs...)
+        @test pkg === SciMLTesting
+        LAST_KWARGS[] = (; kwargs...)
+        return true
+    end
 end
 
 module FakeJET
@@ -24,26 +31,71 @@ module FakeJET
         @test mode === :typo
         return true
     end
+    # report_package variant for jet_broken. Returns a fake "result" carrying a list of
+    # reports; get_reports returns it. report_package is report-only, so run_qa must
+    # NOT pass `mode` here — assert we never receive it. REPORTS controls emptiness so a
+    # test can exercise both the Broken (non-empty) and Unexpected-Pass (empty) paths.
+    const REPORTS = Ref{Vector{Symbol}}(Symbol[:fake_report])
+    const LAST_REPORT_KWARGS = Ref{Any}(nothing)
+    struct FakeResult
+        reports::Vector{Symbol}
+    end
+    function report_package(pkg; mode = :__never__, kwargs...)
+        @test pkg === SciMLTesting
+        @test mode === :__never__         # `mode` must be dropped for report mode
+        LAST_REPORT_KWARGS[] = (; kwargs...)
+        return FakeResult(REPORTS[])
+    end
+    get_reports(r::FakeResult) = r.reports
 end
 
 # Stand-in ExplicitImports: the 6 checks run_qa/run_explicit_imports call. Each
 # returns `nothing` on success (matching ExplicitImports' API); the public check
-# also asserts it received the per-check ignore-list routed through `ei_kwargs`.
+# also asserts it received the per-check ignore-list routed through `ei_kwargs`. To
+# exercise the `ei_broken` Broken path, FINDINGS names the checks that should report a
+# *finding* (a non-`nothing` return) so `@test_broken check(...) === nothing` registers
+# Broken; default empty => all checks pass (preserving the non-broken tests).
 module FakeExplicitImports
     using Test: @test
     import ..SciMLTesting
+    const FINDINGS = Ref{Vector{Symbol}}(Symbol[])
+    _short(f::Symbol) = Symbol(replace(String(f), "check_" => ""))
+    _result(f::Symbol) = _short(f) in FINDINGS[] ? "<finding>" : nothing
     for f in (
             :check_no_implicit_imports, :check_no_stale_explicit_imports,
             :check_all_explicit_imports_via_owners, :check_all_qualified_accesses_via_owners,
             :check_all_explicit_imports_are_public,
         )
-        @eval $f(pkg; kwargs...) = (@test pkg === SciMLTesting; nothing)
+        @eval $f(pkg; kwargs...) = (@test pkg === SciMLTesting; _result($(QuoteNode(f))))
     end
     function check_all_qualified_accesses_are_public(pkg; ignore = (), kwargs...)
         @test pkg === SciMLTesting
         @test ignore == (:internal_thing,)
-        return nothing
+        return _result(:check_all_qualified_accesses_are_public)
     end
+end
+
+# A minimal AbstractTestSet that just collects every recorded result (including
+# nested testsets) and NEVER throws on finish. Wrapping a run_qa call in one lets a
+# test inspect the Broken/Pass/Fail/Error counts a broken-marker produced without
+# those results bubbling up to (and failing) the enclosing suite. `Test.NoThrowTestSet`
+# is unexported and absent on Julia 1.10, so we define our own.
+mutable struct ProbeTestSet <: Test.AbstractTestSet
+    description::String
+    results::Vector{Any}
+    ProbeTestSet(desc::String; kwargs...) = new(desc, Any[])
+end
+Test.record(ts::ProbeTestSet, res) = (push!(ts.results, res); res)
+# `@testset` dynamically propagates this set's type to nested plain `@testset` blocks
+# (even those compiled in another module, e.g. run_qa's), so each nested set is a
+# ProbeTestSet too. On finish a nested set must attach itself to its parent (exactly
+# as DefaultTestSet does) so the full result tree is reachable from the outermost set;
+# the outermost set just returns itself and never throws.
+function Test.finish(ts::ProbeTestSet)
+    if Test.get_testset_depth() != 0
+        Test.record(Test.get_testset(), ts)
+    end
+    return ts
 end
 
 @testset "SciMLTesting" begin
@@ -259,6 +311,195 @@ end
             SciMLTesting; Aqua = nothing, JET = nothing,
             ExplicitImports = nothing, explicit_imports = true
         )
+    end
+
+    @testset "run_qa broken markers" begin
+        # Count every test result of a kind recursively in a testset's results tree
+        # (a testset's children are themselves testsets). Used to assert that the
+        # broken-marker kwargs register `Broken`/`Error` results without `Fail`s.
+        function count_results(ts)
+            counts = Dict(:pass => 0, :fail => 0, :error => 0, :broken => 0)
+            for r in ts.results
+                if r isa Test.Pass
+                    counts[:pass] += 1
+                elseif r isa Test.Fail
+                    counts[:fail] += 1
+                elseif r isa Test.Error
+                    counts[:error] += 1
+                elseif r isa Test.Broken
+                    counts[:broken] += 1
+                elseif r isa Test.AbstractTestSet
+                    sub = count_results(r)
+                    for k in keys(counts)
+                        counts[k] += sub[k]
+                    end
+                end
+            end
+            return counts
+        end
+
+        # Run a body inside a ProbeTestSet and return the result counts. Because the
+        # nested @testset that run_qa opens does not name its own type, Test propagates
+        # ProbeTestSet to it (and to its children), so NOTHING throws on finish — even
+        # the Unexpected-Pass (Error) case — and every result is collected for counting.
+        function counts_of(body)
+            ts = @testset ProbeTestSet "probe" begin
+                body()
+            end
+            return count_results(ts)
+        end
+
+        # `aqua_broken` disables the named sub-check in the test_all call AND emits one
+        # placeholder Broken per name. No JET/EI here.
+        FakeAqua.LAST_KWARGS[] = nothing
+        c = counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = FakeAqua, JET = nothing, ExplicitImports = nothing,
+                clean_sources = false, aqua_broken = (:ambiguities, :deps_compat),
+            )
+        end
+        # The disabled sub-checks were merged into the Aqua.test_all call as `false`.
+        kw = FakeAqua.LAST_KWARGS[]
+        @test kw.ambiguities === false
+        @test kw.deps_compat === false
+        # Two placeholder Broken results (one per name), zero failures.
+        @test c[:broken] == 2
+        @test c[:fail] == 0
+        @test c[:error] == 0
+
+        # Broken-disable wins over a conflicting aqua_kwargs entry.
+        FakeAqua.LAST_KWARGS[] = nothing
+        counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = FakeAqua, JET = nothing, ExplicitImports = nothing,
+                clean_sources = false,
+                aqua_kwargs = (; ambiguities = true), aqua_broken = (:ambiguities,),
+            )
+        end
+        @test FakeAqua.LAST_KWARGS[].ambiguities === false   # broken-disable overrode `true`
+
+        # `jet_broken` with a non-empty report registers exactly one Broken (the
+        # `@test_broken isempty(...)`), no failures; and `mode` was dropped (FakeJET's
+        # report_package asserts it never receives `mode`), while target_modules passes through.
+        FakeJET.REPORTS[] = Symbol[:fake_report]
+        FakeJET.LAST_REPORT_KWARGS[] = nothing
+        c = counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = nothing, JET = FakeJET, ExplicitImports = nothing,
+                jet_broken = true,
+                jet_kwargs = (; target_modules = (SciMLTesting,), mode = :typo),
+            )
+        end
+        @test c[:broken] == 1
+        @test c[:fail] == 0
+        @test c[:error] == 0
+        @test FakeJET.LAST_REPORT_KWARGS[].target_modules == (SciMLTesting,)
+        @test !haskey(FakeJET.LAST_REPORT_KWARGS[], :mode)
+
+        # `jet_broken` with an EMPTY report -> `@test_broken isempty(...)` is an
+        # Unexpected Pass, which Test records as an Error (auto-flag the fix). No Fail.
+        FakeJET.REPORTS[] = Symbol[]
+        c = counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = nothing, JET = FakeJET, ExplicitImports = nothing,
+                jet_broken = true,
+            )
+        end
+        @test c[:error] == 1     # Unexpected Pass surfaces as an Error
+        @test c[:broken] == 0
+        @test c[:fail] == 0
+        FakeJET.REPORTS[] = Symbol[:fake_report]   # restore default for other testsets
+
+        # `ei_broken` routes the named check through @test_broken. With that check
+        # reporting a finding, it registers Broken (the finding is suppressed); the
+        # other five pass. One name broken -> 1 Broken, 0 Fail, 0 Error.
+        FakeExplicitImports.FINDINGS[] = Symbol[:no_implicit_imports]
+        c = counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = nothing, JET = nothing,
+                ExplicitImports = FakeExplicitImports, explicit_imports = true,
+                ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))),
+                ei_broken = (:no_implicit_imports,),
+            )
+        end
+        @test c[:broken] == 1
+        @test c[:pass] >= 5      # the other checks pass (plus FakeExplicitImports @tests)
+        @test c[:fail] == 0
+        @test c[:error] == 0
+
+        # A still-failing check NOT listed in ei_broken stays a hard @test (Fail), so a
+        # genuine regression is never silently swallowed by the broken machinery.
+        FakeExplicitImports.FINDINGS[] = Symbol[:no_stale_explicit_imports]
+        c = counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = nothing, JET = nothing,
+                ExplicitImports = FakeExplicitImports, explicit_imports = true,
+                ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))),
+                ei_broken = (:no_implicit_imports,),   # different check than the finding
+            )
+        end
+        @test c[:fail] == 1      # the unlisted finding fails hard
+        @test c[:broken] == 0
+
+        # An ei_broken check that has been FIXED (no finding) is an Unexpected Pass
+        # (Error) -> auto-flag prompting the caller to drop the name.
+        FakeExplicitImports.FINDINGS[] = Symbol[]
+        c = counts_of() do
+            run_explicit_imports(
+                SciMLTesting, FakeExplicitImports;
+                ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))),
+                ei_broken = (:no_implicit_imports,),
+            )
+        end
+        @test c[:error] == 1     # Unexpected Pass surfaces as Error
+        @test c[:broken] == 0
+        @test c[:fail] == 0
+
+        # The direct helper honors ei_broken too (Broken path).
+        FakeExplicitImports.FINDINGS[] = Symbol[:all_explicit_imports_are_public]
+        c = counts_of() do
+            run_explicit_imports(
+                SciMLTesting, FakeExplicitImports;
+                ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))),
+                ei_broken = (:all_explicit_imports_are_public,),
+            )
+        end
+        @test c[:broken] == 1
+        @test c[:fail] == 0
+        FakeExplicitImports.FINDINGS[] = Symbol[]   # restore default for other testsets
+
+        # All three at once (the realistic conversion case): Aqua ambiguities broken +
+        # JET broken + one EI check broken. Broken count > 0, zero failures.
+        FakeJET.REPORTS[] = Symbol[:fake_report]
+        FakeExplicitImports.FINDINGS[] = Symbol[:no_implicit_imports]
+        c = counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = FakeAqua, JET = FakeJET,
+                ExplicitImports = FakeExplicitImports, explicit_imports = true,
+                clean_sources = false,
+                aqua_broken = (:ambiguities,), jet_broken = true,
+                ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))),
+                ei_broken = (:no_implicit_imports,),
+            )
+        end
+        @test c[:broken] == 3    # aqua placeholder + jet + ei
+        @test c[:fail] == 0
+        @test c[:error] == 0
+        FakeExplicitImports.FINDINGS[] = Symbol[]   # restore default for other testsets
+
+        # Defaults: empty broken-sets reproduce pre-1.6 behavior (no Broken, no Fail).
+        FakeAqua.LAST_KWARGS[] = nothing
+        c = counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = FakeAqua, JET = FakeJET, ExplicitImports = nothing,
+                clean_sources = false,
+            )
+        end
+        @test c[:broken] == 0
+        @test c[:fail] == 0
+        @test c[:error] == 0
+        # No broken-disable keys leaked into the Aqua call.
+        @test !haskey(FakeAqua.LAST_KWARGS[], :ambiguities)
     end
 
     @testset "run_qa enable-flag defaulting" begin
