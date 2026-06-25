@@ -36,7 +36,7 @@ module SciMLTesting
 
 using Pkg: Pkg
 using TOML: TOML
-using Test: Test, @testset, @test
+using Test: Test, @testset, @test, @test_broken
 using SafeTestsets: SafeTestsets, @safetestset
 using Aqua: Aqua
 using ExplicitImports: ExplicitImports
@@ -581,7 +581,9 @@ end
            explicit_imports = false,
            clean_sources = true,
            aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
-           ei_kwargs = (;), testset = "Quality Assurance")
+           ei_kwargs = (;),
+           aqua_broken = (), jet_broken = false, ei_broken = (),
+           testset = "Quality Assurance")
 
 Run the standard SciML quality-assurance body for module `pkg`.
 
@@ -626,6 +628,46 @@ are broken in a single-package checkout, but the flag makes the intent explicit)
 This replaces the per-repo `qa.jl`/`jet.jl` bodies that all call
 `Aqua.test_all(pkg)` and `JET.test_package(pkg; target_modules = (pkg,), mode = :typo)`.
 
+# Known-broken findings (`aqua_broken`, `jet_broken`, `ei_broken`)
+
+When the fleet-wide conversion of a hand-rolled `qa.jl` to `run_qa` would re-red a
+repo with a *known* Aqua/JET/ExplicitImports finding that is tracked in a GitHub
+issue, the broken-marker kwargs preserve that repo's existing `@test_broken`
+suppressions instead of either failing the QA lane or silently dropping a check.
+Each marks its check as `@test_broken` so a green CI lane records `Broken`, not
+`Fail`. Defaults are empty/`false`, so omitting all three is byte-for-byte the
+pre-1.6 behavior.
+
+  * `aqua_broken` — a collection of `Aqua.test_all` sub-check names (`Symbol`s:
+    `:ambiguities`, `:unbound_args`, `:undefined_exports`, `:project_extras`,
+    `:stale_deps`, `:deps_compat`, `:piracies`, `:persistent_tasks`). For each name,
+    `run_qa` (a) **disables** that sub-check in the `Aqua.test_all` call by merging
+    `name => false` over `aqua_kwargs` (the broken-disable wins over any `aqua_kwargs`
+    entry, so you need not also pass `name = false` yourself), and (b) emits one
+    `@test_broken false` inside a nested `@testset "aqua: <name> (broken)"` so the
+    suppression is visible and counted in the summary. **This is a tracked
+    placeholder, not an auto-detector**: a fixed sub-check is *not* flagged
+    automatically — the caller removes the name from `aqua_broken` when the tracking
+    issue is closed. (Reliable per-sub-check auto-flagging is not robust across Aqua
+    versions, so this mirrors the documented-suppression pattern the fleet already
+    uses with `Aqua.test_all(pkg; <check> = false)` plus a manual `@test_broken`.)
+  * `jet_broken::Bool` — when the JET check runs (`jet`) and `jet_broken` is `true`,
+    instead of the hard `JET.test_package(pkg; jet_kwargs...)`, `run_qa` runs
+    `rep = JET.report_package(pkg; <report kwargs>)` and asserts
+    `@test_broken isempty(JET.get_reports(rep))`. This **auto-flags**: while reports
+    remain it records `Broken`; once JET is clean (`isempty` is `true`) the
+    `@test_broken` becomes an `Unexpected Pass` (an `Error`), prompting the caller to
+    drop `jet_broken`. `report_package` is report-only, so the `mode` key in
+    `jet_kwargs` (a `test_package`-only pass/fail config) is dropped for the report
+    call; the JET config keys `report_package` honors (`target_modules`,
+    `target_defined_modules`, `ignored_modules`, ...) are passed through unchanged.
+  * `ei_broken` — a collection of ExplicitImports check short-names (the part after
+    `check_`, e.g. `:no_implicit_imports`, `:all_explicit_imports_are_public`),
+    threaded into [`run_explicit_imports`](@ref). A named check runs as
+    `@test_broken check(pkg; ...) === nothing` instead of `@test ... === nothing`.
+    This **auto-flags** like `jet_broken`: once the check passes, the `@test_broken`
+    becomes an `Unexpected Pass`.
+
 # Examples
 
 ```julia
@@ -647,6 +689,14 @@ run_qa(MyPackage)
 # Explicitly threading the modules in still works (backward-compatible):
 using SciMLTesting, Aqua, JET
 run_qa(MyPackage; Aqua = Aqua, JET = JET, jet = true)
+
+# A repo with a tracked Aqua ambiguities finding, JET known-broken, and one EI check
+# known-broken — preserve the suppressions while converting its hand-rolled qa.jl:
+using SciMLTesting, JET, MyPackage
+run_qa(MyPackage; explicit_imports = true,
+    aqua_broken = (:ambiguities,),   # placeholder: remove when the issue closes
+    jet_broken = true,               # auto-flags Unexpected Pass once JET is clean
+    ei_broken = (:no_implicit_imports,))  # auto-flags once the check passes
 ```
 """
 function run_qa(
@@ -661,6 +711,9 @@ function run_qa(
         aqua_kwargs = (;),
         jet_kwargs = (; target_modules = (pkg,), mode = :typo),
         ei_kwargs = (;),
+        aqua_broken = (),
+        jet_broken::Bool = false,
+        ei_broken = (),
         testset::AbstractString = "Quality Assurance",
     )
     # Validate before entering the @testset: a `throw` inside a testset is
@@ -674,17 +727,51 @@ function run_qa(
         throw(ArgumentError("run_qa: `explicit_imports = true` but the `ExplicitImports` module is `nothing`; ExplicitImports is a SciMLTesting dependency, so omit the `ExplicitImports` keyword (or pass `explicit_imports = false` to skip it)"))
     @testset "$testset" begin
         if aqua
-            run_aqua = () -> Aqua.test_all(pkg; aqua_kwargs...)
+            # Disable each known-broken sub-check in the Aqua.test_all call (the
+            # broken-disable wins over any aqua_kwargs entry) and emit a tracked
+            # placeholder per name. Merge order puts the `name => false` pairs last so
+            # they override a same-named aqua_kwargs entry.
+            effective_aqua_kwargs = isempty(aqua_broken) ? aqua_kwargs :
+                merge(NamedTuple(aqua_kwargs), _aqua_broken_disable(aqua_broken))
+            run_aqua = () -> begin
+                Aqua.test_all(pkg; effective_aqua_kwargs...)
+                for name in aqua_broken
+                    @testset "aqua: $(name) (broken)" begin
+                        @test_broken false
+                    end
+                end
+                nothing
+            end
             clean_sources ? with_clean_persistent_tasks_sources(run_aqua) : run_aqua()
         end
-        jet && JET.test_package(pkg; jet_kwargs...)
-        explicit_imports && run_explicit_imports(pkg, ExplicitImports; ei_kwargs)
+        if jet
+            if jet_broken
+                rep = JET.report_package(pkg; _jet_report_kwargs(jet_kwargs)...)
+                @test_broken isempty(JET.get_reports(rep))
+            else
+                JET.test_package(pkg; jet_kwargs...)
+            end
+        end
+        explicit_imports && run_explicit_imports(pkg, ExplicitImports; ei_kwargs, ei_broken)
     end
     return nothing
 end
 
+# Build the `(; name => false, ...)` NamedTuple that disables each named Aqua
+# sub-check when merged over `aqua_kwargs`.
+_aqua_broken_disable(names) = NamedTuple{Tuple(Symbol.(names))}(ntuple(_ -> false, length(names)))
+
+# `JET.report_package` is report-only and takes JET config keys via `jetconfigs...`
+# (target_modules / target_defined_modules / ignored_modules / ...). It does NOT have
+# a pass/fail `mode`, which is a `JET.test_package`-only config; drop it for the
+# report call. All other jet_kwargs pass through unchanged.
+function _jet_report_kwargs(jet_kwargs)
+    nt = NamedTuple(jet_kwargs)
+    return haskey(nt, :mode) ? Base.structdiff(nt, NamedTuple{(:mode,)}) : nt
+end
+
 """
-    run_explicit_imports(pkg, ExplicitImports; ei_kwargs = (;))
+    run_explicit_imports(pkg, ExplicitImports; ei_kwargs = (;), ei_broken = ())
 
 Run ExplicitImports.jl's standard checks (no-implicit-imports, no-stale-explicit-
 imports, all-explicit-imports-via-owners, all-qualified-accesses-via-owners) plus
@@ -695,8 +782,14 @@ so this helper stays usable with any compatible module. `ei_kwargs`
 is a `NamedTuple` keyed by each check's short name (the part after `check_`); its
 value is that check's keyword arguments, so callers curate per-check ignore-lists,
 e.g. `ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:foo,)))`.
+
+`ei_broken` is a collection of those same short-names whose checks are *known-broken*
+(tracked in a GitHub issue). A check whose name is in `ei_broken` runs as
+`@test_broken check(pkg; ...) === nothing` instead of `@test ... === nothing`, so a
+green lane records `Broken` while the finding stands and an `Unexpected Pass` once
+the check passes (prompting the caller to drop the name).
 """
-function run_explicit_imports(pkg::Module, ExplicitImports; ei_kwargs = (;))
+function run_explicit_imports(pkg::Module, ExplicitImports; ei_kwargs = (;), ei_broken = ())
     checks = (
         :no_implicit_imports, :no_stale_explicit_imports,
         :all_explicit_imports_via_owners, :all_qualified_accesses_via_owners,
@@ -706,7 +799,11 @@ function run_explicit_imports(pkg::Module, ExplicitImports; ei_kwargs = (;))
         for name in checks
             check = getproperty(ExplicitImports, Symbol("check_", name))
             @testset "$(name)" begin
-                @test check(pkg; get(ei_kwargs, name, (;))...) === nothing
+                if name in ei_broken
+                    @test_broken check(pkg; get(ei_kwargs, name, (;))...) === nothing
+                else
+                    @test check(pkg; get(ei_kwargs, name, (;))...) === nothing
+                end
             end
         end
     end
