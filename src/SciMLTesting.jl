@@ -776,7 +776,10 @@ end
 Run ExplicitImports.jl's standard checks (no-implicit-imports, no-stale-explicit-
 imports, all-explicit-imports-via-owners, all-qualified-accesses-via-owners) plus
 the public-API checks (all-qualified-accesses-are-public,
-all-explicit-imports-are-public) as a nested `@testset`. The `ExplicitImports`
+all-explicit-imports-are-public) as a nested `@testset`. The two public-API checks
+run **only on Julia >= 1.11** -- the `public` keyword and `Base.ispublic` they rely on
+do not exist on the 1.10 LTS, where a `public`-backported name is not seen as public;
+they are silently skipped on < 1.11. The `ExplicitImports`
 module is taken as an argument (`run_qa` passes its own `ExplicitImports` dependency)
 so this helper stays usable with any compatible module. `ei_kwargs`
 is a `NamedTuple` keyed by each check's short name (the part after `check_`); its
@@ -795,8 +798,16 @@ function run_explicit_imports(pkg::Module, ExplicitImports; ei_kwargs = (;), ei_
         :all_explicit_imports_via_owners, :all_qualified_accesses_via_owners,
         :all_qualified_accesses_are_public, :all_explicit_imports_are_public,
     )
+    # The two public-API checks rely on `Base.ispublic` and the `public` keyword,
+    # which exist only on Julia >= 1.11. On the LTS (1.10) a name marked public via
+    # the `eval(Expr(:public, ...))` / `@public` backport is NOT seen as public, so
+    # these checks spuriously flag genuinely-public names there. Run them only on
+    # >= 1.11 -- this lets consumer qa.jl files drop their per-repo
+    # `if VERSION < v"1.11"` public-API ignore blocks (the simple form just works).
+    public_checks = (:all_qualified_accesses_are_public, :all_explicit_imports_are_public)
     @testset "ExplicitImports" begin
         for name in checks
+            name in public_checks && VERSION < v"1.11" && continue
             check = getproperty(ExplicitImports, Symbol("check_", name))
             @testset "$(name)" begin
                 if name in ei_broken

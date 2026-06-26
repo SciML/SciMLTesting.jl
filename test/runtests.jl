@@ -59,6 +59,7 @@ module FakeExplicitImports
     using Test: @test
     import ..SciMLTesting
     const FINDINGS = Ref{Vector{Symbol}}(Symbol[])
+    const PUBLIC_CALLED = Ref(false)   # set when a public-API check stub runs (gated to >= 1.11)
     _short(f::Symbol) = Symbol(replace(String(f), "check_" => ""))
     _result(f::Symbol) = _short(f) in FINDINGS[] ? "<finding>" : nothing
     for f in (
@@ -69,6 +70,7 @@ module FakeExplicitImports
         @eval $f(pkg; kwargs...) = (@test pkg === SciMLTesting; _result($(QuoteNode(f))))
     end
     function check_all_qualified_accesses_are_public(pkg; ignore = (), kwargs...)
+        PUBLIC_CALLED[] = true
         @test pkg === SciMLTesting
         @test ignore == (:internal_thing,)
         return _result(:check_all_qualified_accesses_are_public)
@@ -456,12 +458,12 @@ end
         @test c[:fail] == 0
 
         # The direct helper honors ei_broken too (Broken path).
-        FakeExplicitImports.FINDINGS[] = Symbol[:all_explicit_imports_are_public]
+        FakeExplicitImports.FINDINGS[] = Symbol[:all_explicit_imports_via_owners]
         c = counts_of() do
             run_explicit_imports(
                 SciMLTesting, FakeExplicitImports;
                 ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))),
-                ei_broken = (:all_explicit_imports_are_public,),
+                ei_broken = (:all_explicit_imports_via_owners,),
             )
         end
         @test c[:broken] == 1
@@ -500,6 +502,16 @@ end
         @test c[:error] == 0
         # No broken-disable keys leaked into the Aqua call.
         @test !haskey(FakeAqua.LAST_KWARGS[], :ambiguities)
+    end
+
+    @testset "public-API EI checks gated to Julia >= 1.11" begin
+        FakeExplicitImports.FINDINGS[] = Symbol[]
+        FakeExplicitImports.PUBLIC_CALLED[] = false
+        run_explicit_imports(
+            SciMLTesting, FakeExplicitImports;
+            ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))),
+        )
+        @test FakeExplicitImports.PUBLIC_CALLED[] == (VERSION >= v"1.11")
     end
 
     @testset "run_qa enable-flag defaulting" begin
