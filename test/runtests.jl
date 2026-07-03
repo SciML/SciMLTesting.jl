@@ -801,19 +801,30 @@ end
         end
         @test ran("core") && !ran("extra") && !ran("qa")
 
-        # "All" runs core + every in-process group + qa.
+        # "All" runs core + every in-process group but NEVER qa: QA is its own
+        # GROUP=QA lane, so a downstream harness that mutates the package's
+        # Project.toml and runs GROUP=All cannot trip the package's Aqua checks.
         clear!()
         withenv("GROUP" => "All") do
             run_tests(; core = core, groups = Dict("Extra" => extra), qa = qa)
         end
-        @test ran("core") && ran("extra") && ran("qa")
+        @test ran("core") && ran("extra") && !ran("qa")
 
         # Empty GROUP normalizes to the default "All".
         clear!()
         withenv("GROUP" => "") do
             run_tests(; core = core, groups = Dict("Extra" => extra), qa = qa)
         end
-        @test ran("core") && ran("extra") && ran("qa")
+        @test ran("core") && ran("extra") && !ran("qa")
+
+        # Curated "All" that explicitly lists "QA" still excludes it (QA is never
+        # part of "All"); the other listed groups still run.
+        clear!()
+        withenv("GROUP" => "All") do
+            run_tests(; core = core, groups = Dict("Extra" => extra), qa = qa,
+                all = ["Core", "Extra", "QA"])
+        end
+        @test ran("core") && ran("extra") && !ran("qa")
 
         # A named functional group runs only that group.
         clear!()

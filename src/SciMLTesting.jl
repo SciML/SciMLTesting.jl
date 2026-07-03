@@ -1349,17 +1349,24 @@ function run_tests(;
 
     if group == "All"
         if all === nothing
-            # Legacy default: core, then every in-process functional group, then qa.
+            # Legacy default: core, then every in-process functional group. QA is
+            # NEVER part of "All" (it runs only as its own GROUP=QA lane), matching
+            # folder-discovery mode and the documented invariant. This keeps a
+            # downstream harness -- which `Pkg.develop`s the upstream package into the
+            # downstream package's own Project.toml and then runs GROUP=All -- from
+            # tripping that package's Aqua stale_deps/deps_compat on the injected dep.
+            # QA belongs to the package's own CI, not to downstream "All" runs.
             _run_group_spec(_group_spec(core), parent; label = "Core")
             for name in sort!(collect(keys(group_table)))
                 spec = _group_spec(group_table[name])
                 spec.env === nothing && _run_body(spec.body; label = name)
             end
-            qa === nothing || _run_group_spec(_group_spec(qa), parent; label = "QA")
         else
             # Curated "All": run exactly the listed keys, in order. `core` runs only
-            # if "Core" is listed; `qa` only if "QA" is listed.
+            # if "Core" is listed. "QA" is always excluded from "All" (see above), so
+            # it is skipped even when a caller lists it in `all`.
             for name in all
+                string(name) == "QA" && continue
                 _run_named_group(string(name), core, group_table, qa, parent)
             end
         end
