@@ -821,8 +821,10 @@ end
         # part of "All"); the other listed groups still run.
         clear!()
         withenv("GROUP" => "All") do
-            run_tests(; core = core, groups = Dict("Extra" => extra), qa = qa,
-                all = ["Core", "Extra", "QA"])
+            run_tests(;
+                core = core, groups = Dict("Extra" => extra), qa = qa,
+                all = ["Core", "Extra", "QA"]
+            )
         end
         @test ran("core") && ran("extra") && !ran("qa")
 
