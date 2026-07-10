@@ -809,6 +809,7 @@ end
         # no `public` names), independent of Julia version.
         st = public_api_names(SciMLTesting)
         @test :run_api_docs in st && :run_qa in st && :run_tests in st
+        @test :run_everything in st
         @test !(:SciMLTesting in st)
     end
 
@@ -1384,6 +1385,60 @@ end
         end
     end
 
+    @testset "run_tests Everything (uncurated full suite, explicit mode)" begin
+        # "Everything" ignores the curated `all` list and runs core + every groups
+        # entry + qa. Contrast with "All", which only runs the curated list and
+        # never QA. (Sub-env activation is covered by other activate_group_env /
+        # QA-folder tests; here bodies are plain thunks so we isolate routing.)
+        root = mktempdir()
+        marker(name) = joinpath(root, "ran_$(name)")
+        ran(name) = isfile(marker(name))
+        clear!() = foreach(["core", "light", "heavy", "qa"]) do n
+            isfile(marker(n)) && rm(marker(n))
+        end
+        touch!(name) = write(marker(name), "1")
+        core = () -> touch!("core")
+        groups = Dict(
+            "Light" => () -> touch!("light"),
+            "Heavy" => () -> touch!("heavy"),
+        )
+        qa = () -> touch!("qa")
+        curated = ["Core", "Light"]   # deliberately omits Heavy and QA
+
+        # Under "All" with a curated list: only Core + Light; never QA / Heavy.
+        clear!()
+        withenv("GROUP" => "All") do
+            run_tests(; core = core, groups = groups, qa = qa, all = curated)
+        end
+        @test ran("core") && ran("light")
+        @test !ran("heavy") && !ran("qa")
+
+        # Under "Everything": core + Heavy + Light + QA, ignoring curated `all`.
+        clear!()
+        withenv("GROUP" => "Everything") do
+            run_tests(; core = core, groups = groups, qa = qa, all = curated)
+        end
+        @test ran("core") && ran("light") && ran("heavy") && ran("qa")
+
+        # run_everything is the thin withenv wrapper around the same path.
+        clear!()
+        run_everything(; core = core, groups = groups, qa = qa, all = curated)
+        @test ran("core") && ran("light") && ran("heavy") && ran("qa")
+
+        # "Everything" is reserved: never misrouted to a sublibrary even with lib_dir.
+        lib = mktempdir()
+        mkdir(joinpath(lib, "SomeSublib"))
+        clear!()
+        withenv("GROUP" => "Everything") do
+            run_tests(;
+                core = core,
+                groups = Dict("Light" => () -> touch!("light")),
+                qa = qa, lib_dir = lib,
+            )
+        end
+        @test ran("core") && ran("light") && ran("qa")
+    end
+
     @testset "run_tests umbrella groups" begin
         # Extension 3: an umbrella key expands to >= 2 member groups, each run in
         # turn. Selecting the umbrella runs all members; selecting a member alone
@@ -1690,6 +1745,22 @@ end
             run_tests(; test_dir = tdir)
         end
         @test ran("Heavy") && !ran("Light") && !ran("core") && !ran("QA")
+
+        # "Everything" runs Core + Light + Heavy + QA (ignores in_all, includes QA).
+        for n in ("core", "Light", "Heavy", "QA")
+            isfile(joinpath(tdir, "ran_$(n)")) && rm(joinpath(tdir, "ran_$(n)"))
+        end
+        withenv("GROUP" => "Everything") do
+            run_tests(; test_dir = tdir)
+        end
+        @test ran("core") && ran("Light") && ran("Heavy") && ran("QA")
+
+        # run_everything hits the same path for folder mode.
+        for n in ("core", "Light", "Heavy", "QA")
+            isfile(joinpath(tdir, "ran_$(n)")) && rm(joinpath(tdir, "ran_$(n)"))
+        end
+        run_everything(; test_dir = tdir)
+        @test ran("core") && ran("Light") && ran("Heavy") && ran("QA")
     end
 
     @testset "run_tests folder mode: non-group subfolder (shared/) is ignored" begin

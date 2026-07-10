@@ -44,7 +44,8 @@ test = ["Test", "SciMLTesting", ...]
 
 | Helper | Summary |
 | --- | --- |
-| `run_tests(; test_dir, core, groups, qa, env, default, sublib_env, all, umbrellas, lib_dir, parent, pkg)` | Declarative top-level dispatcher: owns the whole `runtests.jl` group-routing flow. With no `core`/`groups`/`qa` it runs in folder-discovery mode (groups = folders); supplying any of them selects the explicit-args mode. |
+| `run_tests(; test_dir, core, groups, qa, env, default, sublib_env, all, umbrellas, lib_dir, parent, pkg)` | Declarative top-level dispatcher: owns the whole `runtests.jl` group-routing flow. With no `core`/`groups`/`qa` it runs in folder-discovery mode (groups = folders); supplying any of them selects the explicit-args mode. Reserved aggregates: `"All"` (curated subset for `Pkg.test`) and `"Everything"` (uncurated full suite). |
+| `run_everything(; env = "GROUP", kwargs...)` | Convenience: set `ENV[env] = "Everything"` and call `run_tests`. Prefer for agents / long local full-suite runs. See [Running every test](#running-every-test-groupeverything). |
 | `read_test_groups(test_dir)` | Read `test_dir/test_groups.toml` (the group list + per-group config such as `in_all`) used by folder-discovery mode. |
 | `current_group(; env = "GROUP", default = "All")` | Read the test-group env var, defaulting to `"All"` (empty string also normalizes to the default). |
 | `activate_group_env(group_dir; parent, develop, instantiate, develop_sources)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. |
@@ -124,7 +125,10 @@ path, in sorted order, labelled `"<group>/<basename>"`):
   * **`QA`** → every `*.jl` in `test/qa/` (or `test/QA/`).
   * **`All`** (unset/empty `GROUP`) → Core **plus** every group folder in
     `test_groups.toml` **except** `QA` and except any group marked `in_all = false`
-    (curated All).
+    (curated All — what a bare `Pkg.test` runs).
+  * **`Everything`** → Core **plus every** group folder in `test_groups.toml`,
+    **including** `QA` and groups with `in_all = false`. The uncurated full suite;
+    see [Running every test](#running-every-test-groupeverything).
 
 Guarantees specific to folder mode:
 
@@ -230,10 +234,11 @@ them; all default to the v1.0.0 behavior, so existing callers are unchanged.
     off via `withenv(sublib_env => subgroup)`, not `env`.
 
   * **`all`** — a curated list of the group keys `"All"` runs, replacing the
-    hardwired "`core` + every env-less group + `qa`". `core` runs under `"All"` only
-    if `"Core"` is listed, and `qa` only if `"QA"` is listed — so a repo can exclude
-    `qa` and heavy groups (OrdinaryDiffEq's `"All"` excludes `AlgConvergence_*` and
-    QA) while keeping them selectable by name.
+    hardwired "`core` + every env-less group". `core` runs under `"All"` only if
+    `"Core"` is listed — so a repo can exclude heavy groups (OrdinaryDiffEq's
+    `"All"` excludes `AlgConvergence_*`, Downstream, GPU, …) while keeping them
+    selectable by name. `"QA"` is never part of `"All"` (even if listed). The
+    reserved `"Everything"` group ignores this list and runs every group plus QA.
 
   * **`umbrellas`** — a `Dict` mapping an umbrella key to a list of member group
     keys. When `GROUP` equals the umbrella key, every member runs in order. Members
@@ -415,6 +420,68 @@ activate_group_env(
     parent = [joinpath(@__DIR__, ".."), joinpath(@__DIR__, "..", "..", "..")],
 )
 ```
+
+## Running every test (`GROUP=Everything`)
+
+`"All"` (the default when `GROUP` is unset — what a bare `Pkg.test` runs) is
+**intentionally curated**. It covers a decent subset so local and CI smoke runs
+finish in a reasonable time. Groups marked `in_all = false`, QA, Downstream,
+GPU/CUDA, long AlgConvergence suites, and other heavy or environment-specific
+groups are left out of `"All"` on purpose (OrdinaryDiffEq.jl and NonlinearSolve.jl
+are the canonical examples of this curation).
+
+Agents (and humans who want full confidence) sometimes need to run **everything**,
+even when that takes many hours. Use the reserved group name `"Everything"`:
+
+```bash
+# Full suite — may take many hours on large monorepos (e.g. OrdinaryDiffEq).
+# Do not use a short timeout; budget overnight-scale wall clock if needed.
+GROUP=Everything julia --project -e 'using Pkg; Pkg.test(coverage=false)'
+
+# Packages that read a non-default group env var (NonlinearSolve, …):
+NONLINEARSOLVE_TEST_GROUP=Everything julia --project -e 'using Pkg; Pkg.test()'
+
+# Direct runtests.jl when the test env is already active:
+GROUP=Everything julia --project=test test/runtests.jl
+```
+
+Or the thin convenience wrapper (forwards every keyword to `run_tests`):
+
+```julia
+using SciMLTesting
+run_everything()                                    # folder-discovery packages
+run_everything(; env = "NONLINEARSOLVE_TEST_GROUP") # non-default group env var
+run_everything(; test_dir = @__DIR__)               # if call-site inference fails
+```
+
+No per-repo change is required when the package already dispatches through
+`run_tests` (OrdinaryDiffEq.jl, NonlinearSolve.jl, folder-discovery packages, …):
+setting `GROUP=Everything` is enough.
+
+| | `"All"` (default / `Pkg.test`) | `"Everything"` |
+| --- | --- | --- |
+| Core | yes (unless curated `all` omits it) | yes (if a `core` body is supplied) |
+| Groups with `in_all = false` | no | **yes** |
+| Groups with a sub-`env` (Downstream, GPU, …) | no (explicit-mode default) | **yes** |
+| Curated out of the `all = [...]` list | no | **yes** (list ignored) |
+| QA | **never** | **yes** (if a `qa` body / QA folder exists) |
+| Monorepo `lib/<Sublib>` packages | no | no — name those as their own `GROUP` |
+
+**Caveats for agents**
+
+  * **Runtime.** Large monorepos can take on the order of **hours** (≈11h is
+    realistic for OrdinaryDiffEq). A multi-hour run is not a hang — wait it out.
+  * **Hardware / env groups.** GPU, CUDA, and similar groups **are** included. On a
+    machine without that hardware they will fail; that is intentional for a full
+    suite. To skip them, select groups by name instead of using `"Everything"`.
+  * **Special-cased groups outside `run_tests`.** A few monorepos still branch on a
+    group before calling `run_tests` (e.g. NonlinearSolve's `Trim`). Those are not
+    covered by `"Everything"` unless the repo also handles `GROUP == "Everything"`
+    (or folds the group into `run_tests`). Prefer routing special groups through
+    `run_tests` so `"Everything"` covers them automatically.
+  * **Sublibraries.** `"Everything"` does not `Pkg.test` every `lib/<Sub>`. Cover a
+    sublibrary with `GROUP=<Sublib>` / `GROUP=<Sublib>_<group>`, or the monorepo's
+    sublibrary CI.
 
 ## License
 
