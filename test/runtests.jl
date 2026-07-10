@@ -77,6 +77,23 @@ module FakeExplicitImports
     end
 end
 
+# Fixture exercising run_api_docs / public_api_names against a real module with a
+# known mix of documented and undocumented public API. On Julia >= 1.11 it also
+# declares `public` names (the eval(Expr(:public, ...)) form is a syntax error on the
+# 1.10 LTS, so it is guarded out there — matching how public_api_names sees only
+# exported names on 1.10).
+module ApiFixture
+    export documented_fn, undocumented_fn, DocumentedType
+    "documented_fn doc" documented_fn(x) = x
+    undocumented_fn(x) = x
+    "DocumentedType doc" struct DocumentedType end
+    @static if VERSION >= v"1.11"
+        eval(Expr(:public, :documented_public, :undocumented_public))
+    end
+    "documented_public doc" documented_public(x) = x
+    undocumented_public(x) = x
+end
+
 # A minimal AbstractTestSet that just collects every recorded result (including
 # nested testsets) and NEVER throws on finish. Wrapping a run_qa call in one lets a
 # test inspect the Broken/Pass/Fail/Error counts a broken-marker produced without
@@ -769,6 +786,221 @@ end
         finally
             Pkg.activate(original_project)
         end
+    end
+
+    @testset "public_api_names" begin
+        api = public_api_names(ApiFixture)
+        @test issorted(api)
+        @test !(nameof(ApiFixture) in api)     # the module's own name is dropped
+        # Exported names are always present; `public`-declared names only on >= 1.11.
+        @test :documented_fn in api
+        @test :undocumented_fn in api
+        @test :DocumentedType in api
+        if VERSION >= v"1.11"
+            @test :documented_public in api
+            @test :undocumented_public in api
+        else
+            @test !(:documented_public in api)   # `public` keyword is 1.11+
+        end
+
+        # SciMLTesting's own exported API is exactly what `export` lists (it declares
+        # no `public` names), independent of Julia version.
+        st = public_api_names(SciMLTesting)
+        @test :run_api_docs in st && :run_qa in st && :run_tests in st
+        @test !(:SciMLTesting in st)
+    end
+
+    @testset "_doc_entry_name" begin
+        @test SciMLTesting._doc_entry_name("foo") == :foo
+        @test SciMLTesting._doc_entry_name("MyPkg.foo") == :foo
+        @test SciMLTesting._doc_entry_name("foo(x::Int)") == :foo
+        @test SciMLTesting._doc_entry_name("MyPkg.foo(x::Int, y)") == :foo
+        @test SciMLTesting._doc_entry_name("Base.SubMod.bar") == :bar
+        @test SciMLTesting._doc_entry_name("@mac") == Symbol("@mac")
+        @test SciMLTesting._doc_entry_name("MyPkg.@mac") == Symbol("@mac")
+    end
+
+    @testset "_rendered_doc_names" begin
+        # A docs/src tree with a @docs block (module-qualified + signature entries) in
+        # one file and a plain-prose file with no block in another.
+        droot = mktempdir()
+        src = joinpath(droot, "src"); mkpath(joinpath(src, "manual"))
+        write(
+            joinpath(src, "index.md"),
+            "# Home\n\nsome prose\n\n```@docs\nMyPkg.foo\nbar(x::Int)\n@mac\n```\n\nmore prose\n",
+        )
+        write(joinpath(src, "manual", "extra.md"), "# Extra\n\n```@docs\nbaz\n```\n")
+        write(joinpath(src, "prose.md"), "# Just prose\n\nno docs block here\n")
+        (rendered, autodocs) = SciMLTesting._rendered_doc_names(src)
+        @test rendered == Set([:foo, :bar, Symbol("@mac"), :baz])
+        @test autodocs == false
+
+        # An @autodocs block flips the wholesale flag.
+        adroot = mktempdir()
+        asrc = joinpath(adroot, "src"); mkpath(asrc)
+        write(
+            joinpath(asrc, "api.md"),
+            "# API\n\n```@autodocs\nModules = [MyPkg]\n```\n",
+        )
+        (_, autodocs2) = SciMLTesting._rendered_doc_names(asrc)
+        @test autodocs2 == true
+
+        # A missing docs dir yields an empty set (never errors).
+        (empty_rendered, empty_auto) = SciMLTesting._rendered_doc_names(joinpath(droot, "nope"))
+        @test isempty(empty_rendered) && empty_auto == false
+    end
+
+    @testset "run_api_docs docstrings check" begin
+        # Reuse the ProbeTestSet + count_results helpers from the broken-markers set to
+        # count Pass/Fail/Broken without failing the enclosing suite.
+        function count_results(ts)
+            counts = Dict(:pass => 0, :fail => 0, :error => 0, :broken => 0)
+            for r in ts.results
+                if r isa Test.Pass
+                    counts[:pass] += 1
+                elseif r isa Test.Fail
+                    counts[:fail] += 1
+                elseif r isa Test.Error
+                    counts[:error] += 1
+                elseif r isa Test.Broken
+                    counts[:broken] += 1
+                elseif r isa Test.AbstractTestSet
+                    sub = count_results(r)
+                    for k in keys(counts)
+                        counts[k] += sub[k]
+                    end
+                end
+            end
+            return counts
+        end
+        counts_of(body) = count_results(
+            @testset ProbeTestSet "probe" begin
+                body()
+            end
+        )
+
+        # All-documented public API passes with no failures. SciMLTesting itself is the
+        # real, non-mocked case: every exported name has a docstring, so this both
+        # proves the happy path AND guards the package's own API-doc coverage.
+        c = counts_of() do
+            run_api_docs(SciMLTesting)
+        end
+        @test c[:fail] == 0 && c[:error] == 0
+        @test c[:pass] >= 1
+
+        # The fixture has undocumented public API -> one Fail (the docstrings @test).
+        c = counts_of() do
+            run_api_docs(ApiFixture)
+        end
+        @test c[:fail] == 1
+        @test c[:broken] == 0
+
+        # Ignoring the undocumented names makes it pass. (:undocumented_public is not in
+        # the API on 1.10, so ignoring it there is a harmless no-op.)
+        c = counts_of() do
+            run_api_docs(ApiFixture; ignore = (:undocumented_fn, :undocumented_public))
+        end
+        @test c[:fail] == 0 && c[:error] == 0
+        @test c[:pass] == 1
+
+        # docstrings_broken records Broken while names remain undocumented (migration).
+        c = counts_of() do
+            run_api_docs(ApiFixture; docstrings_broken = true)
+        end
+        @test c[:broken] == 1
+        @test c[:fail] == 0
+
+        # A fully-documented API under docstrings_broken is an Unexpected Pass (Error),
+        # auto-flagging the caller to drop the flag.
+        c = counts_of() do
+            run_api_docs(SciMLTesting; docstrings_broken = true)
+        end
+        @test c[:error] == 1
+        @test c[:broken] == 0
+        @test c[:fail] == 0
+    end
+
+    @testset "run_api_docs rendered check" begin
+        function count_results(ts)
+            counts = Dict(:pass => 0, :fail => 0, :error => 0, :broken => 0)
+            for r in ts.results
+                if r isa Test.Pass
+                    counts[:pass] += 1
+                elseif r isa Test.Fail
+                    counts[:fail] += 1
+                elseif r isa Test.Error
+                    counts[:error] += 1
+                elseif r isa Test.Broken
+                    counts[:broken] += 1
+                elseif r isa Test.AbstractTestSet
+                    sub = count_results(r)
+                    for k in keys(counts)
+                        counts[k] += sub[k]
+                    end
+                end
+            end
+            return counts
+        end
+        counts_of(body) = count_results(
+            @testset ProbeTestSet "probe" begin
+                body()
+            end
+        )
+
+        api = public_api_names(ApiFixture)
+        # A docs/src listing every public API name in a @docs block -> rendered passes.
+        droot = mktempdir()
+        src = joinpath(droot, "src"); mkpath(src)
+        write(
+            joinpath(src, "api.md"),
+            "# API\n\n```@docs\n" * join(("ApiFixture." * String(n) for n in api), "\n") * "\n```\n",
+        )
+        c = counts_of() do
+            run_api_docs(ApiFixture; docstrings = false, rendered = true, docs_src = src)
+        end
+        @test c[:fail] == 0 && c[:error] == 0
+        @test c[:pass] == 1
+
+        # Dropping one name from the block -> rendered fails (that name is unrendered).
+        write(
+            joinpath(src, "api.md"),
+            "# API\n\n```@docs\n" *
+                join(("ApiFixture." * String(n) for n in api if n != first(api)), "\n") * "\n```\n",
+        )
+        c = counts_of() do
+            run_api_docs(ApiFixture; docstrings = false, rendered = true, docs_src = src)
+        end
+        @test c[:fail] == 1
+
+        # ... but rendered_ignore on the dropped name makes it pass again.
+        c = counts_of() do
+            run_api_docs(
+                ApiFixture; docstrings = false, rendered = true, docs_src = src,
+                rendered_ignore = (first(api),),
+            )
+        end
+        @test c[:fail] == 0 && c[:pass] == 1
+
+        # An @autodocs block satisfies the rendered check wholesale (no per-name list).
+        adroot = mktempdir()
+        asrc = joinpath(adroot, "src"); mkpath(asrc)
+        write(joinpath(asrc, "api.md"), "```@autodocs\nModules = [ApiFixture]\n```\n")
+        c = counts_of() do
+            run_api_docs(ApiFixture; docstrings = false, rendered = true, docs_src = asrc)
+        end
+        @test c[:fail] == 0 && c[:pass] == 1
+    end
+
+    @testset "run_qa api_docs integration" begin
+        # api_docs = true routes to run_api_docs; against SciMLTesting (fully documented
+        # public API) with the other tools off, run_qa is a clean pass. Exercises the
+        # api_docs_kwargs forwarding too.
+        run_qa(
+            SciMLTesting; Aqua = nothing, JET = nothing, ExplicitImports = nothing,
+            api_docs = true, api_docs_kwargs = (; docstrings = true),
+        )
+        # Default api_docs = false must not run the check (no docs assertions here).
+        run_qa(SciMLTesting; Aqua = nothing, JET = nothing, ExplicitImports = nothing)
     end
 
     @testset "run_tests routing" begin
