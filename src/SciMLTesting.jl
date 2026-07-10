@@ -22,7 +22,13 @@ setup. The top-level [`run_tests`](@ref) dispatcher owns the whole `runtests.jl`
 control flow, so a repo replaces its hand-written `if GROUP == ...` ladder with a
 single declarative call.
 
-It stays light: beyond the standard libraries `Pkg`, `TOML`, and `Test` and the
+The same QA aggregator also owns the public-API *documentation* check: [`run_api_docs`](@ref)
+asserts every exported/`public` name has a docstring (and, opt-in, is rendered in the
+manual). It runs by default inside [`run_qa`](@ref) (`api_docs = true`), so repos drop
+their hand-rolled `test/QA/public_api_docs.jl` and get the check for free from a plain
+`run_qa(MyPkg)`.
+
+It stays light: beyond the standard libraries `Pkg`, `TOML`, `Test`, and `REPL` and the
 tiny `SafeTestsets` package (whose `@safetestset` macro runs each file-path group
 body in its own isolated module), it depends only on the lightweight, broad-compat
 QA tools `Aqua` and `ExplicitImports`, so [`run_qa`](@ref) runs them without the
@@ -40,10 +46,15 @@ using Test: Test, @testset, @test, @test_broken
 using SafeTestsets: SafeTestsets, @safetestset
 using Aqua: Aqua
 using ExplicitImports: ExplicitImports
+# REPL is imported purely for its load-time side effect: on Julia >= 1.11 the methods
+# of `Base.Docs.doc(::Base.Docs.Binding)` (the docstring lookup `run_api_docs` uses)
+# live in the REPL stdlib and are absent until it is loaded. Importing it here makes
+# the docstring check work in a bare `Pkg.test` process that never starts a REPL.
+import REPL
 
 export current_group, activate_group_env, run_qa, run_explicit_imports, detect_sublibrary_group,
     develop_sources!, run_tests, read_test_groups,
-    with_clean_persistent_tasks_sources
+    with_clean_persistent_tasks_sources, run_api_docs, public_api_names
 
 # Group names that are never sublibraries and never named functional groups: the
 # routing keywords `run_tests` and `detect_sublibrary_group` reserve.
@@ -578,10 +589,10 @@ end
 """
     run_qa(pkg; Aqua = Aqua, JET = ..., ExplicitImports = ExplicitImports,
            aqua = Aqua !== nothing, jet = JET !== nothing,
-           explicit_imports = false,
+           explicit_imports = false, api_docs = true,
            clean_sources = true,
            aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
-           ei_kwargs = (;),
+           ei_kwargs = (;), api_docs_kwargs = (;),
            aqua_broken = (), jet_broken = false, ei_broken = (),
            testset = "Quality Assurance")
 
@@ -601,16 +612,22 @@ Each tool runs if it is both available and enabled:
   * `JET` + `jet` ⇒ `JET.test_package(pkg; jet_kwargs...)`,
   * `ExplicitImports` + `explicit_imports` ⇒ ExplicitImports' standard + public-API
     checks (see [`run_explicit_imports`](@ref)).
+  * `api_docs` ⇒ the public-API documentation check (see [`run_api_docs`](@ref)): every
+    exported/`public` name has a docstring (and, if `api_docs_kwargs` opts in with
+    `rendered = true`, is rendered in the manual).
 
 Enable-flag defaults: `aqua` defaults to `Aqua !== nothing` (on — Aqua is always
 available; pass `Aqua = nothing` or `aqua = false` to skip it), and `jet` defaults to
-`JET !== nothing` (on exactly when `JET` has been loaded/registered). `explicit_imports`
-defaults to **`false`** — a deliberate opt-in: because `ExplicitImports` is always
-available, defaulting it on would silently turn the (per-repo-curated) ExplicitImports
-checks on for every existing `run_qa` caller on a routine version bump, so a repo must
-ask for them with `explicit_imports = true`. Setting an enable flag `true` while its
-module is unavailable is a configuration error and throws an `ArgumentError`. The whole
-thing runs inside a `@testset` named `testset`.
+`JET !== nothing` (on exactly when `JET` has been loaded/registered). `api_docs` defaults
+to **`true`**: the public-API docstring check needs no extra dependency and is a baseline
+QA expectation across the fleet, so it runs for every `run_qa` caller by default —
+document a repo's public API, or curate exceptions via `api_docs_kwargs` (`ignore`,
+`docstrings_broken`), or pass `api_docs = false` to skip it. `api_docs_kwargs` is
+forwarded to [`run_api_docs`](@ref) (e.g. `rendered`, `ignore`, `docstrings_broken`).
+`explicit_imports` still defaults to **`false`** — its per-repo-curated ignore-lists make
+it a deliberate opt-in (`explicit_imports = true`). Setting an enable flag `true` while
+its module is unavailable is a configuration error and throws an `ArgumentError`. The
+whole thing runs inside a `@testset` named `testset`.
 
 `clean_sources` (default `true`) wraps the `Aqua.test_all` call in
 [`with_clean_persistent_tasks_sources`](@ref), which strips *broken* path-`[sources]`
@@ -707,10 +724,12 @@ function run_qa(
         aqua::Bool = Aqua !== nothing,
         jet::Bool = JET !== nothing,
         explicit_imports::Bool = false,
+        api_docs::Bool = true,
         clean_sources::Bool = true,
         aqua_kwargs = (;),
         jet_kwargs = (; target_modules = (pkg,), mode = :typo),
         ei_kwargs = (;),
+        api_docs_kwargs = (;),
         aqua_broken = (),
         jet_broken::Bool = false,
         ei_broken = (),
@@ -753,6 +772,7 @@ function run_qa(
             end
         end
         explicit_imports && run_explicit_imports(pkg, ExplicitImports; ei_kwargs, ei_broken)
+        api_docs && run_api_docs(pkg; api_docs_kwargs...)
     end
     return nothing
 end
@@ -815,6 +835,201 @@ function run_explicit_imports(pkg::Module, ExplicitImports; ei_kwargs = (;), ei_
                 else
                     @test check(pkg; get(ei_kwargs, name, (;))...) === nothing
                 end
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    public_api_names(pkg::Module) -> Vector{Symbol}
+
+Return `pkg`'s public API: every exported name plus, on Julia >= 1.11, every name
+declared with the `public` keyword — the exact set `names(pkg; all = false,
+imported = false)` yields — with the module's own name dropped and the result sorted.
+
+This is the set [`run_api_docs`](@ref) requires documentation for. On the Julia 1.10
+LTS the `public` keyword does not exist, so a name made public only via a `public`
+backport is *not* reported here (Base's `names` does not see it); on 1.10 the set is
+therefore the exported names alone. Re-exported names (e.g. via `Reexport`) are
+included when they are re-exported with `export`, since `names` reports them.
+
+# Examples
+
+```julia
+julia> public_api_names(SciMLTesting)
+11-element Vector{Symbol}:
+ :activate_group_env
+ ⋮
+```
+"""
+function public_api_names(pkg::Module)
+    api = filter!(!=(nameof(pkg)), names(pkg; all = false, imported = false))
+    return sort!(api)
+end
+
+# Whether `pkg.name` resolves to a docstring. Uses `Base.Docs.doc` on the *binding*
+# (not the object), so a re-exported name that is documented in the module that
+# actually defines it counts as documented here too (the binding follows the import
+# alias to that module's docs). `import REPL` at load time ensures the binding-lookup
+# methods exist on Julia >= 1.11. A name with no binding in `pkg` (should not happen
+# for a `names`-reported symbol) counts as undocumented.
+function _has_docstring(pkg::Module, name::Symbol)
+    isdefined(pkg, name) || return false
+    doc = sprint(show, MIME"text/plain"(), Base.Docs.doc(Base.Docs.Binding(pkg, name)))
+    return !occursin("No documentation found", doc)
+end
+
+# The bare name referenced by one line inside a ```@docs``` fenced block. A `@docs`
+# entry is a name, optionally module-qualified and/or with a call signature, e.g.
+# `foo`, `MyPkg.foo`, `foo(x::Int)`, `MyPkg.@mac`. Take the first whitespace token,
+# drop a call-signature suffix, then drop a leading module qualifier (the text after
+# the last dot), preserving a leading `@` for macros.
+function _doc_entry_name(line::AbstractString)
+    tok = String(first(split(line)))
+    tok = String(first(split(tok, '(')))
+    dot = findlast('.', tok)
+    dot === nothing || (tok = tok[nextind(tok, dot):end])
+    return Symbol(tok)
+end
+
+# Scan every `*.md` file under `docs_src` and collect the set of names that appear
+# inside a ```@docs``` fenced block, plus whether any ```@autodocs``` block is present.
+# An `@autodocs` block renders whole modules' docstrings, so its presence means the
+# per-name "rendered" check cannot meaningfully single out a missing name — the caller
+# treats that as "everything documented is rendered". A missing `docs_src` yields an
+# empty set and `autodocs = false`.
+function _rendered_doc_names(docs_src::AbstractString)
+    rendered = Set{Symbol}()
+    autodocs = false
+    isdir(docs_src) || return (rendered, autodocs)
+    for (dir, _, files) in walkdir(docs_src)
+        for file in files
+            endswith(file, ".md") || continue
+            in_docs = false
+            for raw in eachline(joinpath(dir, file))
+                line = strip(raw)
+                if startswith(line, "```@docs")
+                    in_docs = true
+                    continue
+                elseif startswith(line, "```@autodocs")
+                    autodocs = true
+                    in_docs = false
+                    continue
+                elseif in_docs && startswith(line, "```")
+                    in_docs = false
+                    continue
+                end
+                in_docs || continue
+                (isempty(line) || startswith(line, "#")) && continue
+                push!(rendered, _doc_entry_name(line))
+            end
+        end
+    end
+    return (rendered, autodocs)
+end
+
+# Default docs source dir for a package: <pkgroot>/docs/src, or "" when the package
+# root cannot be located (e.g. `pkg` is `Main`). "" is a non-directory, so the
+# rendered scan finds nothing and the check fails loudly if it was opted into without
+# a resolvable docs tree.
+_default_docs_src(pkg::Module) =
+    (root = pkgdir(pkg); root === nothing ? "" : joinpath(root, "docs", "src"))
+
+"""
+    run_api_docs(pkg::Module; docstrings = true, rendered = false,
+                 docs_src = <pkgroot>/docs/src,
+                 ignore = (), rendered_ignore = (),
+                 docstrings_broken = false, rendered_broken = false,
+                 testset = "Public API documentation")
+
+Assert that `pkg`'s public API (see [`public_api_names`](@ref)) is documented.
+
+This is the shared, per-repo-free replacement for the hand-rolled
+`test/QA/public_api_docs.jl` files that were copied into individual SciML repos.
+[`run_qa`](@ref) runs it by default (`api_docs = true`), so a plain `run_qa(MyPkg)`
+already covers the docstring check; call `run_api_docs` directly only to run it outside
+`run_qa` or to opt into the `rendered` check.
+
+Two checks, each its own nested `@testset`:
+
+  * **docstrings** (`docstrings = true`, on by default): every public API name has a
+    docstring. A re-exported name documented in its defining package counts as
+    documented (the check follows the binding, not a local docstring), so a repo is
+    not forced to redocument names it re-exports from a dependency.
+  * **rendered** (`rendered = false`, opt-in): every public API name appears inside a
+    ```` ```@docs ```` block somewhere under `docs_src`, so it is rendered in the
+    manual. This is opt-in because it needs a resolvable docs tree and does not fit
+    every repo (monorepos with shared docs, packages with no manual). If any
+    ```` ```@autodocs ```` block is present the check passes wholesale — `@autodocs`
+    renders whole modules, so anything with a docstring is already rendered.
+
+`docs_src` defaults to `<pkgroot>/docs/src` located via `pkgdir(pkg)`, so a repo whose
+docs live in the standard place needs no path plumbing.
+
+`ignore` (for the docstring check) and `rendered_ignore` (for the rendered check) are
+collections of names (`Symbol`s) to exclude — use them for names that legitimately
+have no local documentation obligation, e.g. a re-export you cannot document at the
+source, with a comment pointing at the tracking issue.
+
+`docstrings_broken` / `rendered_broken` mark the respective check `@test_broken` (for a
+repo mid-migration with many undocumented names): a green lane records `Broken` while
+names remain undocumented, and the `@test_broken` flips to an `Unexpected Pass` (an
+`Error`) once the API is fully documented, prompting the caller to drop the flag.
+
+On Julia 1.10, `public_api_names` returns only the exported names (the `public` keyword
+is 1.11+), so the checks cover exactly the names Base reports as public on the running
+version — no per-repo `if VERSION` guards needed.
+
+# Examples
+
+```julia
+# In test/qa/qa.jl — the whole per-repo public-API-docs check:
+using SciMLTesting, MyPackage
+run_api_docs(MyPackage)                       # docstrings only
+run_api_docs(MyPackage; rendered = true)      # also require rendering in docs/src
+
+# It runs by default inside run_qa; use api_docs_kwargs to configure it, or
+# api_docs = false to skip it:
+run_qa(MyPackage; explicit_imports = true,
+       api_docs_kwargs = (; rendered = true, ignore = (:reexported_from_dep,)))
+```
+
+See also [`run_qa`](@ref), whose `api_docs`/`api_docs_kwargs` keywords call this.
+"""
+function run_api_docs(
+        pkg::Module;
+        docstrings::Bool = true,
+        rendered::Bool = false,
+        docs_src::AbstractString = _default_docs_src(pkg),
+        ignore = (),
+        rendered_ignore = (),
+        docstrings_broken::Bool = false,
+        rendered_broken::Bool = false,
+        testset::AbstractString = "Public API documentation",
+    )
+    api = public_api_names(pkg)
+    @testset "$testset" begin
+        if docstrings
+            skip = Set{Symbol}(Symbol.(ignore))
+            undocumented = sort!(filter(n -> !(n in skip) && !_has_docstring(pkg, n), api))
+            @testset "public API has docstrings" begin
+                docstrings_broken ? (@test_broken isempty(undocumented)) :
+                    (@test isempty(undocumented))
+                isempty(undocumented) ||
+                    @info "run_api_docs: public API names missing a docstring" pkg undocumented
+            end
+        end
+        if rendered
+            (rendered_names, autodocs) = _rendered_doc_names(docs_src)
+            skip = Set{Symbol}(Symbol.(rendered_ignore))
+            unrendered = autodocs ? Symbol[] :
+                sort!(filter(n -> !(n in skip) && !(n in rendered_names), api))
+            @testset "public API is rendered in docs" begin
+                rendered_broken ? (@test_broken isempty(unrendered)) :
+                    (@test isempty(unrendered))
+                isempty(unrendered) ||
+                    @info "run_api_docs: public API names not rendered in a @docs block" pkg docs_src unrendered
             end
         end
     end
