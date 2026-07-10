@@ -537,17 +537,19 @@ end
         # ExplicitImports is always available (opt-in, so a routine bump never turns
         # the per-repo ExplicitImports checks on for existing callers). `aqua` is
         # forced off throughout so the real Aqua never runs against SciMLTesting itself.
+        # api_docs is forced off here too, so this testset stays focused on JET/aqua
+        # defaulting (the default-on api_docs check has its own testset).
         saved = copy(SciMLTesting._QA_MODULES)
         try
             delete!(SciMLTesting._QA_MODULES, :JET)
-            # JET unregistered + aqua off + EI default off => run_qa is a no-op (no error).
-            run_qa(SciMLTesting; aqua = false)
+            # JET unregistered + aqua off + EI/api_docs off => run_qa is a no-op (no error).
+            run_qa(SciMLTesting; aqua = false, api_docs = false)
 
             # Register a Fake JET: `jet` now defaults on and run_qa runs it.
             SciMLTesting._register_qa_tool!(:JET, FakeJET)
             @test SciMLTesting._qa_tool(:JET) === FakeJET
-            run_qa(SciMLTesting; aqua = false)              # runs FakeJET via the registry default
-            run_qa(SciMLTesting; aqua = false, jet = false) # explicit off skips it (no error)
+            run_qa(SciMLTesting; aqua = false, api_docs = false)              # runs FakeJET via the registry default
+            run_qa(SciMLTesting; aqua = false, jet = false, api_docs = false) # explicit off skips it (no error)
         finally
             empty!(SciMLTesting._QA_MODULES)
             merge!(SciMLTesting._QA_MODULES, saved)
@@ -991,16 +993,61 @@ end
         @test c[:fail] == 0 && c[:pass] == 1
     end
 
-    @testset "run_qa api_docs integration" begin
-        # api_docs = true routes to run_api_docs; against SciMLTesting (fully documented
-        # public API) with the other tools off, run_qa is a clean pass. Exercises the
-        # api_docs_kwargs forwarding too.
-        run_qa(
-            SciMLTesting; Aqua = nothing, JET = nothing, ExplicitImports = nothing,
-            api_docs = true, api_docs_kwargs = (; docstrings = true),
+    @testset "run_qa api_docs integration (default on)" begin
+        function count_results(ts)
+            counts = Dict(:pass => 0, :fail => 0, :error => 0, :broken => 0)
+            for r in ts.results
+                if r isa Test.Pass
+                    counts[:pass] += 1
+                elseif r isa Test.Fail
+                    counts[:fail] += 1
+                elseif r isa Test.Error
+                    counts[:error] += 1
+                elseif r isa Test.Broken
+                    counts[:broken] += 1
+                elseif r isa Test.AbstractTestSet
+                    sub = count_results(r)
+                    for k in keys(counts)
+                        counts[k] += sub[k]
+                    end
+                end
+            end
+            return counts
+        end
+        counts_of(body) = count_results(
+            @testset ProbeTestSet "probe" begin
+                body()
+            end
         )
-        # Default api_docs = false must not run the check (no docs assertions here).
-        run_qa(SciMLTesting; Aqua = nothing, JET = nothing, ExplicitImports = nothing)
+
+        # api_docs defaults to `true`: a plain run_qa (all other tools off) still runs
+        # the public-API docstring check. Against SciMLTesting (fully documented) that is
+        # a clean pass — the default-on check fires (>=1 pass) with no failures.
+        c = counts_of() do
+            run_qa(SciMLTesting; Aqua = nothing, JET = nothing, ExplicitImports = nothing)
+        end
+        @test c[:pass] >= 1
+        @test c[:fail] == 0 && c[:error] == 0 && c[:broken] == 0
+
+        # api_docs_kwargs is forwarded (docstrings_broken flips the pass to a Broken).
+        c = counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = nothing, JET = nothing, ExplicitImports = nothing,
+                api_docs_kwargs = (; docstrings_broken = true),
+            )
+        end
+        @test c[:error] == 1     # fully-documented under docstrings_broken => Unexpected Pass
+        @test c[:fail] == 0
+
+        # api_docs = false skips the check entirely: with every tool off, run_qa records
+        # nothing at all.
+        c = counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = nothing, JET = nothing, ExplicitImports = nothing,
+                api_docs = false,
+            )
+        end
+        @test c[:pass] == 0 && c[:fail] == 0 && c[:error] == 0 && c[:broken] == 0
     end
 
     @testset "run_tests routing" begin

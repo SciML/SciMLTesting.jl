@@ -49,7 +49,7 @@ test = ["Test", "SciMLTesting", ...]
 | `current_group(; env = "GROUP", default = "All")` | Read the test-group env var, defaulting to `"All"` (empty string also normalizes to the default). |
 | `activate_group_env(group_dir; parent, develop, instantiate, develop_sources)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. |
 | `develop_sources!(group_dir; parent)` | On Julia < 1.11, `Pkg.develop` the env's `[sources]` path graph (recursively); a no-op on 1.11+. |
-| `run_qa(pkg; Aqua, JET, ExplicitImports, aqua, jet, explicit_imports, api_docs, aqua_broken, jet_broken, ei_broken, ...)` | Run the standard Aqua/JET/ExplicitImports QA body, plus (opt-in) the public-API documentation check. Aqua + ExplicitImports come from SciMLTesting's deps (always available; `aqua` on by default, `explicit_imports` opt-in); `using JET` registers JET via its weakdep extension and turns the JET check on; `api_docs = true` runs `run_api_docs` (forward config via `api_docs_kwargs`). The `*_broken` kwargs mark known-broken findings as `@test_broken` (see [Known-broken findings](#known-broken-findings-aqua_broken-jet_broken-ei_broken)). |
+| `run_qa(pkg; Aqua, JET, ExplicitImports, aqua, jet, explicit_imports, api_docs, aqua_broken, jet_broken, ei_broken, ...)` | Run the standard Aqua/JET/ExplicitImports QA body, plus the public-API documentation check. Aqua + ExplicitImports come from SciMLTesting's deps (always available; `aqua` on by default, `explicit_imports` opt-in); `using JET` registers JET via its weakdep extension and turns the JET check on; `api_docs` is **on by default** and runs `run_api_docs` (configure via `api_docs_kwargs`, or `api_docs = false` to skip). The `*_broken` kwargs mark known-broken findings as `@test_broken` (see [Known-broken findings](#known-broken-findings-aqua_broken-jet_broken-ei_broken)). |
 | `run_api_docs(pkg; docstrings = true, rendered = false, docs_src, ignore, rendered_ignore, docstrings_broken, rendered_broken)` | Assert every exported/`public` name of `pkg` has a docstring (and, opt-in, is rendered in a `@docs` block under `docs/src`). The shared replacement for per-repo `test/QA/public_api_docs.jl` files. |
 | `public_api_names(pkg)` | The sorted public API of `pkg` (exported names, plus `public` names on Julia ≥ 1.11), with the module's own name dropped. |
 | `detect_sublibrary_group(group, lib_dir; default_group = "Core")` | Map a `GROUP` value to a `(sublibrary, test_group)` pair for a monorepo. |
@@ -310,19 +310,23 @@ run_qa(MyPackage; explicit_imports = true,
 
 Several SciML repos had grown a hand-copied `test/QA/public_api_docs.jl` asserting that
 every exported name has a docstring (and is rendered in the manual). `run_api_docs`
-replaces those per-repo files with one shared, maintained helper — call it directly, or
-turn it on inside `run_qa` with `api_docs = true`:
+replaces those per-repo files with one shared, maintained helper. It runs **by default
+inside `run_qa`** (`api_docs = true`), so a plain `run_qa(MyPackage)` already enforces
+the docstring check — configure it with `api_docs_kwargs`, or pass `api_docs = false` to
+skip:
 
 ```julia
 using SciMLTesting, MyPackage
 
-# Standalone: the whole public-API-docs check.
+# In the QA body — the docstring check runs by default:
+run_qa(MyPackage; explicit_imports = true)
+
+# Also require each public name is rendered in a docs/src @docs block:
+run_qa(MyPackage; explicit_imports = true, api_docs_kwargs = (; rendered = true))
+
+# Standalone (outside run_qa), e.g. as its own QA file:
 run_api_docs(MyPackage)                    # every exported/`public` name has a docstring
 run_api_docs(MyPackage; rendered = true)   # also require each is in a docs/src @docs block
-
-# Or fold it into the QA body alongside Aqua/JET/ExplicitImports:
-run_qa(MyPackage; explicit_imports = true, api_docs = true,
-    api_docs_kwargs = (; rendered = true))
 ```
 
   * **`docstrings`** (default `true`) — every name in `public_api_names(pkg)` has a

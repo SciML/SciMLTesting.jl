@@ -24,8 +24,9 @@ single declarative call.
 
 The same QA aggregator also owns the public-API *documentation* check: [`run_api_docs`](@ref)
 asserts every exported/`public` name has a docstring (and, opt-in, is rendered in the
-manual), so repos drop their hand-rolled `test/QA/public_api_docs.jl` in favor of
-`run_qa(MyPkg; api_docs = true)`.
+manual). It runs by default inside [`run_qa`](@ref) (`api_docs = true`), so repos drop
+their hand-rolled `test/QA/public_api_docs.jl` and get the check for free from a plain
+`run_qa(MyPkg)`.
 
 It stays light: beyond the standard libraries `Pkg`, `TOML`, `Test`, and `REPL` and the
 tiny `SafeTestsets` package (whose `@safetestset` macro runs each file-path group
@@ -588,7 +589,7 @@ end
 """
     run_qa(pkg; Aqua = Aqua, JET = ..., ExplicitImports = ExplicitImports,
            aqua = Aqua !== nothing, jet = JET !== nothing,
-           explicit_imports = false, api_docs = false,
+           explicit_imports = false, api_docs = true,
            clean_sources = true,
            aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
            ei_kwargs = (;), api_docs_kwargs = (;),
@@ -611,21 +612,22 @@ Each tool runs if it is both available and enabled:
   * `JET` + `jet` ⇒ `JET.test_package(pkg; jet_kwargs...)`,
   * `ExplicitImports` + `explicit_imports` ⇒ ExplicitImports' standard + public-API
     checks (see [`run_explicit_imports`](@ref)).
-  * `api_docs` ⇒ the public-API documentation checks (see [`run_api_docs`](@ref)): every
+  * `api_docs` ⇒ the public-API documentation check (see [`run_api_docs`](@ref)): every
     exported/`public` name has a docstring (and, if `api_docs_kwargs` opts in with
-    `rendered = true`, is rendered in the manual). Needs no extra dependency — it uses
-    only Base's doc system — so, like `explicit_imports`, it is a deliberate opt-in.
+    `rendered = true`, is rendered in the manual).
 
 Enable-flag defaults: `aqua` defaults to `Aqua !== nothing` (on — Aqua is always
 available; pass `Aqua = nothing` or `aqua = false` to skip it), and `jet` defaults to
-`JET !== nothing` (on exactly when `JET` has been loaded/registered). `explicit_imports`
-and `api_docs` default to **`false`** — a deliberate opt-in: both need no extra
-dependency, so defaulting them on would silently turn (per-repo-curated) checks on for
-every existing `run_qa` caller on a routine version bump, so a repo must ask for them
-with `explicit_imports = true` / `api_docs = true`. `api_docs_kwargs` is forwarded to
-[`run_api_docs`](@ref) (e.g. `rendered`, `ignore`, `docstrings_broken`). Setting an
-enable flag `true` while its module is unavailable is a configuration error and throws
-an `ArgumentError`. The whole thing runs inside a `@testset` named `testset`.
+`JET !== nothing` (on exactly when `JET` has been loaded/registered). `api_docs` defaults
+to **`true`**: the public-API docstring check needs no extra dependency and is a baseline
+QA expectation across the fleet, so it runs for every `run_qa` caller by default —
+document a repo's public API, or curate exceptions via `api_docs_kwargs` (`ignore`,
+`docstrings_broken`), or pass `api_docs = false` to skip it. `api_docs_kwargs` is
+forwarded to [`run_api_docs`](@ref) (e.g. `rendered`, `ignore`, `docstrings_broken`).
+`explicit_imports` still defaults to **`false`** — its per-repo-curated ignore-lists make
+it a deliberate opt-in (`explicit_imports = true`). Setting an enable flag `true` while
+its module is unavailable is a configuration error and throws an `ArgumentError`. The
+whole thing runs inside a `@testset` named `testset`.
 
 `clean_sources` (default `true`) wraps the `Aqua.test_all` call in
 [`with_clean_persistent_tasks_sources`](@ref), which strips *broken* path-`[sources]`
@@ -722,7 +724,7 @@ function run_qa(
         aqua::Bool = Aqua !== nothing,
         jet::Bool = JET !== nothing,
         explicit_imports::Bool = false,
-        api_docs::Bool = false,
+        api_docs::Bool = true,
         clean_sources::Bool = true,
         aqua_kwargs = (;),
         jet_kwargs = (; target_modules = (pkg,), mode = :typo),
@@ -944,9 +946,10 @@ _default_docs_src(pkg::Module) =
 Assert that `pkg`'s public API (see [`public_api_names`](@ref)) is documented.
 
 This is the shared, per-repo-free replacement for the hand-rolled
-`test/QA/public_api_docs.jl` files that were copied into individual SciML repos. Point
-a repo's QA lane at it — directly, or via [`run_qa`](@ref)'s `api_docs = true` flag —
-instead of maintaining the check in every repo.
+`test/QA/public_api_docs.jl` files that were copied into individual SciML repos.
+[`run_qa`](@ref) runs it by default (`api_docs = true`), so a plain `run_qa(MyPkg)`
+already covers the docstring check; call `run_api_docs` directly only to run it outside
+`run_qa` or to opt into the `rendered` check.
 
 Two checks, each its own nested `@testset`:
 
@@ -986,8 +989,9 @@ using SciMLTesting, MyPackage
 run_api_docs(MyPackage)                       # docstrings only
 run_api_docs(MyPackage; rendered = true)      # also require rendering in docs/src
 
-# Via run_qa (opt-in), alongside Aqua/JET/ExplicitImports:
-run_qa(MyPackage; explicit_imports = true, api_docs = true,
+# It runs by default inside run_qa; use api_docs_kwargs to configure it, or
+# api_docs = false to skip it:
+run_qa(MyPackage; explicit_imports = true,
        api_docs_kwargs = (; rendered = true, ignore = (:reexported_from_dep,)))
 ```
 
