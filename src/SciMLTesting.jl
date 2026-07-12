@@ -109,6 +109,12 @@ options. Recognized per-group options:
     explicitly to `false` for documentation/clarity). Set `in_all = false` on any
     heavy or environment-specific group to curate `"All"`. The reserved `"Everything"`
     group ignores `in_all` and runs every declared group (including `"QA"`).
+  * `group` (`String`) — marks the section as a CI-matrix-only *alias* for the named
+    group: it runs that group's body under a different matrix cell (e.g. a 32-bit lane
+    `["Core 32-bit"] group = "Core"` that the CI matrix runs with `arch = "x86"`) and
+    has no test folder of its own. Folder-discovery mode skips such a section under
+    `"All"`/`"Everything"` (the target group already runs) and, if it is selected by
+    its own name, runs the target group rather than demanding a `test/<section>/` folder.
 
 The returned dict preserves declaration order (insertion-ordered), and group names
 are returned verbatim (SciML group names are capitalized: `Core`, `QA`, `Interface`,
@@ -154,6 +160,16 @@ end
 # (it is its own CI lane); any group with `in_all = false` opts out (curated All).
 _group_in_all(name::AbstractString, opts::AbstractDict) =
     name != "QA" && get(opts, "in_all", true) == true
+
+# A test_groups.toml section with a `group` key pointing at another group is a
+# CI-matrix-only alias: it runs that group's body under a different arch/os cell
+# (e.g. a 32-bit lane `["Core 32-bit"] group = "Core" arch = "x86"`) and has no
+# test folder of its own. The CI matrix dispatches GROUP=<target>, so such a
+# section is never selected by its own name in practice; folder discovery skips
+# it under All/Everything (the target group already runs) and, if it is selected
+# directly, redirects to the target rather than demanding a `test/<section>/` folder.
+_group_alias_target(name::AbstractString, opts::AbstractDict) =
+    (g = get(opts, "group", nothing); (g isa AbstractString && g != name) ? g : nothing)
 
 # Resolve a group name to its folder under `test_dir`, trying an exact match first
 # then a case-insensitive match (so group "Interface" finds test/Interface or
@@ -1284,6 +1300,7 @@ function _run_folder_group(
         # top-level Core run above and not re-run as a folder.
         for name in sort!(collect(keys(group_table)))
             name in ("Core", "QA") && continue
+            _group_alias_target(name, group_table[name]) === nothing || continue
             _group_in_all(name, group_table[name]) || continue
             _run_group_folder(test_dir, name, default_parent)
         end
@@ -1295,6 +1312,7 @@ function _run_folder_group(
         _run_core_folder(test_dir)
         for name in sort!(collect(keys(group_table)))
             name == "Core" && continue
+            _group_alias_target(name, group_table[name]) === nothing || continue
             _run_group_folder(test_dir, name, default_parent)
         end
         return nothing
@@ -1307,7 +1325,14 @@ function _run_folder_group(
         _run_group_folder(test_dir, "QA", default_parent)
         return nothing
     elseif haskey(group_table, group)
-        _run_group_folder(test_dir, group, default_parent)
+        # A matrix-only alias section selected by its own name runs the target
+        # group's body rather than demanding a `test/<section>/` folder.
+        target = _group_alias_target(group, group_table[group])
+        if target !== nothing
+            _run_folder_group(target, test_dir, group_table, default_parent)
+        else
+            _run_group_folder(test_dir, group, default_parent)
+        end
         return nothing
     else
         # An unknown group in folder mode is an error rather than a silent Core
