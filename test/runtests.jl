@@ -1763,6 +1763,58 @@ end
         @test ran("core") && ran("Light") && ran("Heavy") && ran("QA")
     end
 
+    @testset "run_tests folder mode: matrix-only `group` alias section demands no folder" begin
+        # A section with a `group` key (e.g. a 32-bit CI lane `["Core 32-bit"]
+        # group = "Core"`) is a matrix-only alias for another group's body. It has
+        # no test folder, so All/Everything must SKIP it (not throw "folder missing"),
+        # and selecting it by name runs the target group.
+        tdir = mktempdir()
+        write(
+            joinpath(tdir, "test_groups.toml"),
+            """
+            ["Core 32-bit"]
+            group = "Core"
+            arch = "x86"
+            [Light]
+            """,
+        )
+        markerfile(rel, name) = "write(joinpath(@__DIR__, \"$(rel)ran_$(name)\"), \"1\")\n"
+        write(
+            joinpath(tdir, "core.jl"),
+            "@testset \"core\" begin @test true end\n" * markerfile("", "core"),
+        )
+        ld = joinpath(tdir, "Light"); mkpath(ld)
+        write(
+            joinpath(ld, "l.jl"),
+            "@testset \"l\" begin @test true end\n" * markerfile("../", "Light"),
+        )
+        ran(n) = isfile(joinpath(tdir, "ran_$(n)"))
+        clear() = for n in ("core", "Light")
+            isfile(joinpath(tdir, "ran_$(n)")) && rm(joinpath(tdir, "ran_$(n)"))
+        end
+
+        # All: the alias section is skipped — no `test/Core 32-bit/` folder is
+        # demanded (previously this threw ArgumentError), Core + Light still run.
+        withenv("GROUP" => "All") do
+            run_tests(; test_dir = tdir)
+        end
+        @test ran("core") && ran("Light")
+
+        # Everything: same skip, no throw.
+        clear()
+        withenv("GROUP" => "Everything") do
+            run_tests(; test_dir = tdir)
+        end
+        @test ran("core") && ran("Light")
+
+        # Selecting the alias by name runs the target group's body (Core), not Light.
+        clear()
+        withenv("GROUP" => "Core 32-bit") do
+            run_tests(; test_dir = tdir)
+        end
+        @test ran("core") && !ran("Light")
+    end
+
     @testset "run_tests folder mode: non-group subfolder (shared/) is ignored" begin
         # A subfolder that is NOT a declared group (test/shared/) is never discovered.
         # It is where shared include/fixture files live. Selecting any group must not
