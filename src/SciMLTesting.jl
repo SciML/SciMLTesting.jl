@@ -11,7 +11,9 @@ and Corleone.jl) repeat the same boilerplate in every `test/runtests.jl` and eve
   * activating a per-group `test/<Group>/Project.toml`, `Pkg.develop`-ing the
     package under test by path (so CI tests the PR-branch code rather than a
     registered version), and `Pkg.instantiate`-ing,
-  * a standard QA group body that runs Aqua and JET, and
+  * a standard QA group body that runs Aqua and JET,
+  * opt-in fresh-process isolation for aggregate members that activate different
+    package environments, and
   * a monorepo root dispatcher that maps a `GROUP` value to a `(sublibrary, group)`
     pair so the bare sublibrary name selects its `Core` group and
     `"<sublibrary>_<group>"` selects a named group.
@@ -1207,14 +1209,8 @@ end
 struct _Unset end
 const _UNSET = _Unset()
 
-# Directory of the file that called `run_tests` (the repo's test/runtests.jl), used
-# as the default `test_dir` in folder-discovery mode. Walks the backtrace outward
-# from `run_tests`, skipping frames inside this module's own source file, and returns
-# the directory of the first external frame with a real file. This lets a repo write
-# a bare `run_tests()` in test/runtests.jl with no `@__DIR__` plumbing. If no external
-# file frame is found (e.g. called from the REPL), errors with guidance to pass
-# `test_dir` explicitly.
-function _caller_test_dir()
+# Find the file that called `run_tests` (normally the repo's test/runtests.jl).
+function _external_callsite_file()
     self = @__FILE__
     for frame in stacktrace()
         file = string(frame.file)
@@ -1224,9 +1220,47 @@ function _caller_test_dir()
         startswith(file, "./") && continue
         occursin("REPL", file) && continue
         path = abspath(file)
-        isfile(path) && return dirname(path)
+        isfile(path) && return path
     end
+    return nothing
+end
+
+# Use the outermost program for subprocess re-entry. The immediate caller can be a
+# helper that only defines a function, while the program includes that helper and
+# invokes it. Calls from `-e` have no program file, so fall back to the call site.
+function _test_entrypoint()
+    program = abspath(Base.PROGRAM_FILE)
+    isfile(program) && return program
+    callsite = _external_callsite_file()
+    callsite !== nothing && return callsite
+    throw(ArgumentError("run_tests: could not determine the test entrypoint from the call site. Environment-backed members of an aggregate group require a runtests file so they can run in fresh Julia processes; select the member group directly when working interactively."))
+end
+
+# Directory of the file that called `run_tests`, used as the default `test_dir` in
+# folder-discovery mode. This lets a repo write a bare `run_tests()` in
+# test/runtests.jl with no `@__DIR__` plumbing.
+function _caller_test_dir()
+    callsite = _external_callsite_file()
+    callsite !== nothing && return dirname(callsite)
     throw(ArgumentError("run_tests (folder mode): could not determine the test directory from the call site; pass `test_dir = @__DIR__` explicitly (e.g. `run_tests(; test_dir = @__DIR__)`)."))
+end
+
+# Julia cannot unload a package after a group switches environments. Reusing one
+# process can therefore combine source from the newly activated environment with an
+# older module already in memory. When requested, run an environment-backed
+# aggregate member by re-entering the test file with that member selected in a fresh
+# process. The active Pkg.test project and current Julia flags (including coverage,
+# depwarn, bounds, and startup-file settings) are preserved by `Base.julia_cmd()`.
+function _run_group_subprocess(group::AbstractString, env::AbstractString)
+    file = _test_entrypoint()
+    isfile(file) ||
+        throw(ArgumentError("run_tests: test entrypoint does not exist: $(file)"))
+    project_file = Base.active_project()
+    cmd = Base.julia_cmd()
+    project_file === nothing || (cmd = `$cmd --project=$(dirname(project_file))`)
+    @info "Running environment-backed test group in a fresh Julia process" group
+    run(addenv(`$cmd $file`, env => group))
+    return nothing
 end
 
 # ---------------------------------------------------------------------------
@@ -1292,6 +1326,8 @@ function _run_folder_group(
         test_dir::AbstractString,
         group_table::AbstractDict,
         default_parent,
+        env::AbstractString,
+        isolate_group_environments::Bool,
     )
     if group == "All"
         _run_core_folder(test_dir)
@@ -1302,7 +1338,13 @@ function _run_folder_group(
             name in ("Core", "QA") && continue
             _group_alias_target(name, group_table[name]) === nothing || continue
             _group_in_all(name, group_table[name]) || continue
-            _run_group_folder(test_dir, name, default_parent)
+            folder = _group_folder(test_dir, name)
+            if isolate_group_environments && folder !== nothing &&
+                    _project_file(folder) !== nothing
+                _run_group_subprocess(name, env)
+            else
+                _run_group_folder(test_dir, name, default_parent)
+            end
         end
         return nothing
     elseif group == "Everything"
@@ -1313,7 +1355,13 @@ function _run_folder_group(
         for name in sort!(collect(keys(group_table)))
             name == "Core" && continue
             _group_alias_target(name, group_table[name]) === nothing || continue
-            _run_group_folder(test_dir, name, default_parent)
+            folder = _group_folder(test_dir, name)
+            if isolate_group_environments && folder !== nothing &&
+                    _project_file(folder) !== nothing
+                _run_group_subprocess(name, env)
+            else
+                _run_group_folder(test_dir, name, default_parent)
+            end
         end
         return nothing
     elseif group == "Core"
@@ -1329,7 +1377,10 @@ function _run_folder_group(
         # group's body rather than demanding a `test/<section>/` folder.
         target = _group_alias_target(group, group_table[group])
         if target !== nothing
-            _run_folder_group(target, test_dir, group_table, default_parent)
+            _run_folder_group(
+                target, test_dir, group_table, default_parent, env,
+                isolate_group_environments
+            )
         else
             _run_group_folder(test_dir, group, default_parent)
         end
@@ -1347,7 +1398,8 @@ end
     run_tests(; core, groups = Dict(), qa = nothing,
               env = "GROUP", default = "All", sublib_env = env,
               all = nothing, umbrellas = Dict(),
-              lib_dir = nothing, parent = nothing, pkg = nothing)
+              lib_dir = nothing, parent = nothing, pkg = nothing,
+              isolate_group_environments = false)
 
 Declarative top-level dispatcher for a SciML `test/runtests.jl`. It owns the whole
 group-routing control flow, so a repo replaces its hand-written `if GROUP == "All"
@@ -1393,7 +1445,8 @@ The model:
     path + instantiate, with the `<1.11` [`develop_sources!`](@ref) backport) before
     running that folder's files. Core uses the main test env (no activation). The
     develop-parent defaults to the repo root (`dirname(test_dir)`); override with
-    `parent`.
+    `parent`. Set `isolate_group_environments = true` to run environment-backed
+    members selected through `"All"` or `"Everything"` in fresh Julia processes.
   * **Enforced coverage.** *Every* `*.jl` file in the selected group's folder runs —
     you cannot forget to register a test file. A declared group whose folder is
     **missing or empty** is an **error** (catches a misnamed or empty group), as is an
@@ -1406,7 +1459,7 @@ The model:
 # Explicit-args mode (v1.1.x — backward-compatible)
 
 Supplying any of `core`, `groups`, or `qa` selects the explicit-args mode below, whose
-behavior is unchanged from v1.1.x.
+behavior is unchanged from v1.1.x unless `isolate_group_environments = true`.
 
 # Arguments
 
@@ -1464,6 +1517,11 @@ behavior is unchanged from v1.1.x.
     and the group folders. Defaults to the directory of the file that called
     `run_tests` (the repo's `test/runtests.jl`); pass `test_dir = @__DIR__` if it
     cannot be inferred from the call site.
+  * `isolate_group_environments` — default `false`. When `true`, an
+    environment-backed member selected through `"All"`, `"Everything"`, or an
+    umbrella runs in a fresh Julia process. This prevents packages loaded from an
+    earlier environment from being combined with source from the newly activated
+    environment. The child preserves the active test project and Julia flags.
 
 # Routing (explicit-args mode)
 
@@ -1588,6 +1646,7 @@ function run_tests(;
         parent = nothing,
         pkg = nothing,
         test_dir = nothing,
+        isolate_group_environments::Bool = false,
     )
     group = current_group(; env = env, default = default)
 
@@ -1600,7 +1659,10 @@ function run_tests(;
         # Default the develop-parent for any sub-env (e.g. test/qa/Project.toml) to the
         # repo root inferred as dirname(test_dir), unless the caller overrode `parent`.
         default_parent = parent === nothing ? dirname(dir) : parent
-        _run_folder_group(group, dir, group_table, default_parent)
+        _run_folder_group(
+            group, dir, group_table, default_parent, env,
+            isolate_group_environments
+        )
         return nothing
     end
 
@@ -1633,7 +1695,10 @@ function run_tests(;
             # it is skipped even when a caller lists it in `all`.
             for name in all
                 string(name) == "QA" && continue
-                _run_named_group(string(name), core, group_table, qa, parent)
+                _run_named_group(
+                    string(name), core, group_table, qa, parent;
+                    isolate_env = isolate_group_environments, env = env,
+                )
             end
         end
         return nothing
@@ -1641,16 +1706,28 @@ function run_tests(;
         # Uncurated full suite: core + every groups entry (env or not) + qa.
         # Ignores the curated `all` list. Sorted group names for determinism; QA last
         # so functional failures surface before the QA lane.
-        core !== nothing && _run_group_spec(_group_spec(core), parent; label = "Core")
+        core !== nothing && _run_named_group(
+            "Core", core, group_table, qa, parent;
+            isolate_env = isolate_group_environments, env = env,
+        )
         for name in sort!(collect(keys(group_table)))
-            _run_group_spec(_group_spec(group_table[name]), parent; label = name)
+            _run_named_group(
+                name, core, group_table, qa, parent;
+                isolate_env = isolate_group_environments, env = env,
+            )
         end
-        qa !== nothing && _run_group_spec(_group_spec(qa), parent; label = "QA")
+        qa !== nothing && _run_named_group(
+            "QA", core, group_table, qa, parent;
+            isolate_env = isolate_group_environments, env = env,
+        )
         return nothing
     elseif haskey(umbrella_table, group)
         # An umbrella key expands to its member groups, each run in turn.
         for member in _as_string_list(umbrella_table[group])
-            _run_named_group(member, core, group_table, qa, parent)
+            _run_named_group(
+                member, core, group_table, qa, parent;
+                isolate_env = isolate_group_environments, env = env,
+            )
         end
         return nothing
     elseif group == "Core"
@@ -1707,6 +1784,10 @@ so every keyword of [`run_tests`](@ref) is accepted and forwarded. The package u
 test does **not** need any change: if its `test/runtests.jl` already calls
 `run_tests` (OrdinaryDiffEq.jl, NonlinearSolve.jl, folder-discovery packages, …),
 setting `GROUP=Everything` (or calling this helper) is enough.
+
+With `isolate_group_environments = true`, an environment-backed member runs in a
+fresh Julia process. The child preserves the active test project and Julia flags,
+including code coverage, depwarn, bounds checking, and startup-file settings.
 
 # How to use it (agents)
 
@@ -1774,17 +1855,26 @@ end
 # Run a named group key against the `groups` table, resolving the reserved
 # "Core"/"QA" keys to the `core`/`qa` bodies. Used by curated-"All" and umbrella
 # expansion so a listed key behaves exactly as if it had been requested via GROUP.
-function _run_named_group(key::AbstractString, core, group_table, qa, parent)
-    if key == "Core"
-        _run_group_spec(_group_spec(core), parent; label = "Core")
+function _run_named_group(
+        key::AbstractString, core, group_table, qa, parent;
+        isolate_env::Bool = false,
+        env::AbstractString = "GROUP",
+    )
+    spec, label = if key == "Core"
+        (_group_spec(core), "Core")
     elseif key == "QA"
         qa === nothing &&
             throw(ArgumentError("run_tests: \"QA\" was listed in `all`/`umbrellas` but no `qa` body was provided"))
-        _run_group_spec(_group_spec(qa), parent; label = "QA")
+        (_group_spec(qa), "QA")
     elseif haskey(group_table, key)
-        _run_group_spec(_group_spec(group_table[key]), parent; label = key)
+        (_group_spec(group_table[key]), key)
     else
         throw(ArgumentError("run_tests: \"$key\" was listed in `all`/`umbrellas` but is not a key of `groups` (nor the reserved \"Core\"/\"QA\")"))
+    end
+    if isolate_env && spec.env !== nothing
+        _run_group_subprocess(key, env)
+    else
+        _run_group_spec(spec, parent; label = label)
     end
     return nothing
 end

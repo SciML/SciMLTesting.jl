@@ -44,7 +44,7 @@ test = ["Test", "SciMLTesting", ...]
 
 | Helper | Summary |
 | --- | --- |
-| `run_tests(; test_dir, core, groups, qa, env, default, sublib_env, all, umbrellas, lib_dir, parent, pkg)` | Declarative top-level dispatcher: owns the whole `runtests.jl` group-routing flow. With no `core`/`groups`/`qa` it runs in folder-discovery mode (groups = folders); supplying any of them selects the explicit-args mode. Reserved aggregates: `"All"` (curated subset for `Pkg.test`) and `"Everything"` (uncurated full suite). |
+| `run_tests(; test_dir, core, groups, qa, env, default, sublib_env, all, umbrellas, lib_dir, parent, pkg, isolate_group_environments)` | Declarative top-level dispatcher: owns the whole `runtests.jl` group-routing flow. With no `core`/`groups`/`qa` it runs in folder-discovery mode (groups = folders); supplying any of them selects the explicit-args mode. Reserved aggregates: `"All"` (curated subset for `Pkg.test`) and `"Everything"` (uncurated full suite). Set `isolate_group_environments = true` to run environment-backed aggregate members in fresh Julia processes. |
 | `run_everything(; env = "GROUP", kwargs...)` | Convenience: set `ENV[env] = "Everything"` and call `run_tests`. Prefer for agents / long local full-suite runs. See [Running every test](#running-every-test-groupeverything). |
 | `read_test_groups(test_dir)` | Read `test_dir/test_groups.toml` (the group list + per-group config such as `in_all`) used by folder-discovery mode. |
 | `current_group(; env = "GROUP", default = "All")` | Read the test-group env var, defaulting to `"All"` (empty string also normalizes to the default). |
@@ -139,7 +139,10 @@ Guarantees specific to folder mode:
   * **Sub-env per group.** If a group folder has its own `Project.toml` (e.g.
     `test/qa/Project.toml`), it is activated (`Pkg.activate` + develop the package by
     path + `instantiate`, with the `<1.11` `[sources]` backport) before its files
-    run. Core has no `Project.toml`, so it uses the main test env.
+    run. Core has no `Project.toml`, so it uses the main test env. With
+    `isolate_group_environments = true`, environment-backed folders selected through
+    `"All"` or `"Everything"` run in fresh Julia processes, preventing packages
+    loaded from an earlier environment from leaking into the group.
   * **Helpers/fixtures.** Only the *selected group's* folder is globbed, so a subfolder
     that is **not** a declared group (e.g. `test/shared/`) is never auto-discovered —
     that is where shared `include` fixtures and helper files live.
@@ -224,7 +227,7 @@ run_tests(;
 #### Complex monorepos: `sublib_env`, curated `all`, umbrella groups
 
 Some monorepo roots (OrdinaryDiffEq.jl, RecursiveArrayTools.jl, ...) need control
-flow that a uniform `GROUP` dispatch cannot express. Three optional kwargs cover
+flow that a uniform `GROUP` dispatch cannot express. Four optional kwargs cover
 them; all default to the v1.0.0 behavior, so existing callers are unchanged.
 
   * **`sublib_env`** — the env var the sublibrary handoff sets, defaulting to `env`.
@@ -244,6 +247,12 @@ them; all default to the v1.0.0 behavior, so existing callers are unchanged.
     keys. When `GROUP` equals the umbrella key, every member runs in order. Members
     may name `groups` entries or the reserved `"Core"`/`"QA"` bodies; an umbrella key
     wins over an identically named `groups` entry.
+
+  * **`isolate_group_environments`** — default `false`. When `true`, a group that
+    declares an `env` and is selected through `"All"`, `"Everything"`, or an umbrella
+    runs in a fresh Julia process. The child re-enters the test entrypoint with the
+    member group selected and preserves the active test project plus Julia flags
+    such as coverage, depwarn, bounds checking, and startup-file settings.
 
 ```julia
 # complex monorepo root test/runtests.jl
@@ -268,6 +277,9 @@ run_tests(;
         "Interface"  => ["InterfaceI", "InterfaceII"],
         "Regression" => ["Regression_I", "Regression_II"],
     ),
+
+    # Keep packages from different per-group environments out of the same process.
+    isolate_group_environments = true,
 
     # Root reads GROUP; sublibraries read ODEDIFFEQ_TEST_GROUP.
     sublib_env = "ODEDIFFEQ_TEST_GROUP",
@@ -457,6 +469,11 @@ run_everything(; test_dir = @__DIR__)               # if call-site inference fai
 No per-repo change is required when the package already dispatches through
 `run_tests` (OrdinaryDiffEq.jl, NonlinearSolve.jl, folder-discovery packages, …):
 setting `GROUP=Everything` is enough.
+
+If the suite loads groups from different package environments, pass
+`isolate_group_environments = true` to `run_tests` (or `run_everything`). Each
+environment-backed aggregate member then runs in a fresh Julia process; the default
+remains the historical in-process behavior.
 
 | | `"All"` (default / `Pkg.test`) | `"Everything"` |
 | --- | --- | --- |
