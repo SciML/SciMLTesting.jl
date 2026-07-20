@@ -900,12 +900,18 @@ function _has_docstring(pkg::Module, name::Symbol)
     return !occursin("No documentation found", doc)
 end
 
-# A re-exported module is documented by its defining package. Rendering it locally with
-# Documenter's @docs pulls that dependency's complete docstring tree into this manual.
+# A re-exported callable, type, or module is documented by its defining package.
+# Rendering it locally with Documenter's @docs pulls that dependency's API tree into
+# this manual. Values with no owning module still require local rendering.
 function _requires_local_rendering(pkg::Module, name::Symbol)
     isdefined(pkg, name) || return true
     value = getfield(pkg, name)
-    return !(value isa Module && parentmodule(value) !== pkg)
+    owner = try
+        parentmodule(value)
+    catch
+        return true
+    end
+    return owner === pkg
 end
 
 # The bare name referenced by one line inside a ```@docs``` fenced block. A `@docs`

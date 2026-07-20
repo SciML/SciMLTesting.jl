@@ -99,6 +99,11 @@ module ModuleReexportFixture
     export SciMLTesting
 end
 
+module FunctionReexportFixture
+    import SciMLTesting: run_qa
+    export run_qa
+end
+
 module LocalModuleFixture
     module LocalSubmodule end
     export LocalSubmodule
@@ -1037,6 +1042,12 @@ end
         end
         @test c[:fail] == 0 && c[:error] == 0 && c[:pass] == 1
         @test :SciMLTesting in public_api_names(ModuleReexportFixture)
+
+        c = counts_of() do
+            run_api_docs(FunctionReexportFixture; docstrings = false, docs_src = rsrc)
+        end
+        @test c[:fail] == 0 && c[:error] == 0 && c[:pass] == 1
+        @test :run_qa in public_api_names(FunctionReexportFixture)
 
         # A package-owned submodule remains part of this package's rendered manual.
         c = counts_of() do
