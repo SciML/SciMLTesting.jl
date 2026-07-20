@@ -543,6 +543,7 @@ end
         c = counts_of() do
             run_qa(
                 SciMLTesting; Aqua = FakeAqua, JET = FakeJET, ExplicitImports = nothing,
+                explicit_imports = false, api_docs = false,
                 clean_sources = false,
             )
         end
