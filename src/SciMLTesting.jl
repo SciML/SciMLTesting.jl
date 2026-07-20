@@ -951,8 +951,8 @@ end
 
 # Default docs source dir for a package: <pkgroot>/docs/src, or "" when the package
 # root cannot be located (e.g. `pkg` is `Main`). "" is a non-directory, so the
-# rendered scan finds nothing and the check fails loudly if it was opted into without
-# a resolvable docs tree.
+# rendered scan finds nothing and the default check fails loudly without a resolvable
+# docs tree.
 _default_docs_src(pkg::Module) =
     (root = pkgdir(pkg); root === nothing ? "" : joinpath(root, "docs", "src"))
 
@@ -968,8 +968,8 @@ Assert that `pkg`'s public API (see [`public_api_names`](@ref)) is documented.
 This is the shared, per-repo-free replacement for the hand-rolled
 `test/QA/public_api_docs.jl` files that were copied into individual SciML repos.
 [`run_qa`](@ref) runs it by default (`api_docs = true`), so a plain `run_qa(MyPkg)`
-already covers the docstring check; call `run_api_docs` directly only to run it outside
-`run_qa` or to opt into the `rendered` check.
+already covers both checks; call `run_api_docs` directly only to run it outside
+`run_qa` or to configure either check independently.
 
 Two checks, each its own nested `@testset`:
 
@@ -977,10 +977,10 @@ Two checks, each its own nested `@testset`:
     docstring. A re-exported name documented in its defining package counts as
     documented (the check follows the binding, not a local docstring), so a repo is
     not forced to redocument names it re-exports from a dependency.
-  * **rendered** (`rendered = false`, opt-in): every public API name appears inside a
+  * **rendered** (`rendered = true`, on by default): every public API name appears inside a
     ```` ```@docs ```` block somewhere under `docs_src`, so it is rendered in the
-    manual. This is opt-in because it needs a resolvable docs tree and does not fit
-    every repo (monorepos with shared docs, packages with no manual). If any
+    manual. Packages without a resolvable local manual must explicitly set
+    `rendered = false`. If any
     ```` ```@autodocs ```` block is present the check passes wholesale — `@autodocs`
     renders whole modules, so anything with a docstring is already rendered.
 
@@ -1011,8 +1011,7 @@ run_api_docs(MyPackage; rendered = false)     # docstrings only
 
 # It runs by default inside run_qa; use api_docs_kwargs to configure it, or
 # api_docs = false to skip it:
-run_qa(MyPackage; explicit_imports = true,
-       api_docs_kwargs = (; rendered = true, ignore = (:reexported_from_dep,)))
+run_qa(MyPackage; api_docs_kwargs = (; ignore = (:reexported_from_dep,)))
 ```
 
 See also [`run_qa`](@ref), whose `api_docs`/`api_docs_kwargs` keywords call this.
