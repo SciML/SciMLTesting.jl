@@ -1057,10 +1057,12 @@ function run_api_docs(
         if rendered
             (rendered_names, autodocs) = _rendered_doc_names(docs_src)
             skip = Set{Symbol}(Symbol.(rendered_ignore))
-            unrendered = autodocs ? Symbol[] : sort!(filter(
-                n -> _requires_local_rendering(pkg, n) && !(n in skip) && !(n in rendered_names),
-                api,
-            ))
+            unrendered = autodocs ? Symbol[] : sort!(
+                filter(
+                    n -> _requires_local_rendering(pkg, n) && !(n in skip) && !(n in rendered_names),
+                    api,
+                )
+            )
             @testset "public API is rendered in docs" begin
                 rendered_broken ? (@test_broken isempty(unrendered)) :
                     (@test isempty(unrendered))
