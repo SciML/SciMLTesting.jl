@@ -99,6 +99,11 @@ module ModuleReexportFixture
     export SciMLTesting
 end
 
+module LocalModuleFixture
+    module LocalSubmodule end
+    export LocalSubmodule
+end
+
 # A minimal AbstractTestSet that just collects every recorded result (including
 # nested testsets) and NEVER throws on finish. Wrapping a run_qa call in one lets a
 # test inspect the Broken/Pass/Fail/Error counts a broken-marker produced without
@@ -1031,6 +1036,13 @@ end
             run_api_docs(ModuleReexportFixture; docstrings = false, docs_src = rsrc)
         end
         @test c[:fail] == 0 && c[:error] == 0 && c[:pass] == 1
+        @test :SciMLTesting in public_api_names(ModuleReexportFixture)
+
+        # A package-owned submodule remains part of this package's rendered manual.
+        c = counts_of() do
+            run_api_docs(LocalModuleFixture; docstrings = false, docs_src = rsrc)
+        end
+        @test c[:fail] == 1
 
         # An @autodocs block satisfies the rendered check wholesale (no per-name list).
         adroot = mktempdir()

@@ -905,7 +905,7 @@ end
 function _requires_local_rendering(pkg::Module, name::Symbol)
     isdefined(pkg, name) || return true
     value = getfield(pkg, name)
-    return !(value isa Module && value !== pkg)
+    return !(value isa Module && parentmodule(value) !== pkg)
 end
 
 # The bare name referenced by one line inside a ```@docs``` fenced block. A `@docs`
