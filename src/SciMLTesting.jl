@@ -609,7 +609,7 @@ end
 """
     run_qa(pkg; Aqua = Aqua, JET = ..., ExplicitImports = ExplicitImports,
            aqua = Aqua !== nothing, jet = JET !== nothing,
-           explicit_imports = false, api_docs = true,
+           explicit_imports = true, api_docs = true,
            clean_sources = true,
            aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
            ei_kwargs = (;), api_docs_kwargs = (;),
@@ -624,7 +624,7 @@ list them as test dependencies. `JET` is the exception: it is compiler-version-p
 and so is kept a *weak* dependency, loaded only on demand. `using JET` in your
 `test/qa/qa.jl` triggers `SciMLTesting`'s JET extension, which auto-registers the
 module; `run_qa` then picks it up. The typical call collapses to just
-`run_qa(MyPkg; explicit_imports = true, ei_kwargs = ...)`.
+`run_qa(MyPkg; ei_kwargs = ...)`.
 
 Each tool runs if it is both available and enabled:
 
@@ -644,9 +644,9 @@ QA expectation across the fleet, so it runs for every `run_qa` caller by default
 document a repo's public API, or curate exceptions via `api_docs_kwargs` (`ignore`,
 `docstrings_broken`), or pass `api_docs = false` to skip it. `api_docs_kwargs` is
 forwarded to [`run_api_docs`](@ref) (e.g. `rendered`, `ignore`, `docstrings_broken`).
-`explicit_imports` still defaults to **`false`** — its per-repo-curated ignore-lists make
-it a deliberate opt-in (`explicit_imports = true`). Setting an enable flag `true` while
-its module is unavailable is a configuration error and throws an `ArgumentError`. The
+`explicit_imports` defaults to **`true`**. Packages with unavoidable dependency
+exceptions provide their per-check ignore-lists through `ei_kwargs`. Setting an enable
+flag `true` while its module is unavailable is a configuration error and throws an `ArgumentError`. The
 whole thing runs inside a `@testset` named `testset`.
 
 `clean_sources` (default `true`) wraps the `Aqua.test_all` call in
@@ -712,12 +712,12 @@ pre-1.6 behavior.
 # per-repo qa.jl collapses to `explicit_imports = true` plus the genuinely per-repo
 # kwargs (the ignore-lists). Aqua + ExplicitImports both run here:
 using SciMLTesting, MyPackage
-run_qa(MyPackage; explicit_imports = true,
+run_qa(MyPackage;
     ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_dep_name,))))
 
 # Add the JET check by `using JET` (its weakdep extension auto-registers it):
 using SciMLTesting, JET, MyPackage
-run_qa(MyPackage; explicit_imports = true)
+run_qa(MyPackage)
 
 # Aqua only — leave `explicit_imports` at its default and don't load JET:
 using SciMLTesting, MyPackage
@@ -730,7 +730,7 @@ run_qa(MyPackage; Aqua = Aqua, JET = JET, jet = true)
 # A repo with a tracked Aqua ambiguities finding, JET known-broken, and one EI check
 # known-broken — preserve the suppressions while converting its hand-rolled qa.jl:
 using SciMLTesting, JET, MyPackage
-run_qa(MyPackage; explicit_imports = true,
+run_qa(MyPackage;
     aqua_broken = (:ambiguities,),   # placeholder: remove when the issue closes
     jet_broken = true,               # auto-flags Unexpected Pass once JET is clean
     ei_broken = (:no_implicit_imports,))  # auto-flags once the check passes
@@ -743,7 +743,7 @@ function run_qa(
         ExplicitImports = ExplicitImports,
         aqua::Bool = Aqua !== nothing,
         jet::Bool = JET !== nothing,
-        explicit_imports::Bool = false,
+        explicit_imports::Bool = true,
         api_docs::Bool = true,
         clean_sources::Bool = true,
         aqua_kwargs = (;),
