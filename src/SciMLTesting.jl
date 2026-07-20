@@ -56,7 +56,7 @@ import REPL
 
 export current_group, activate_group_env, run_qa, run_explicit_imports, detect_sublibrary_group,
     develop_sources!, run_tests, run_everything, read_test_groups,
-    with_clean_persistent_tasks_sources, run_api_docs, public_api_names
+    with_clean_persistent_tasks_sources, run_api_docs, public_api_names, public_reexports
 
 # Group names that are never sublibraries and never named functional groups: the
 # routing keywords `run_tests` and `detect_sublibrary_group` reserve.
@@ -745,6 +745,8 @@ function run_qa(
         jet::Bool = JET !== nothing,
         explicit_imports::Bool = true,
         api_docs::Bool = true,
+        check_reexports::Bool = false,
+        reexports_allow = (),
         clean_sources::Bool = true,
         aqua_kwargs = (;),
         jet_kwargs = (; target_modules = (pkg,), mode = :typo),
@@ -793,6 +795,9 @@ function run_qa(
         end
         explicit_imports && run_explicit_imports(pkg, ExplicitImports; ei_kwargs, ei_broken)
         api_docs && run_api_docs(pkg; api_docs_kwargs...)
+        check_reexports && @testset "No unapproved public reexports" begin
+            @test isempty(public_reexports(pkg; allow = reexports_allow))
+        end
     end
     return nothing
 end
@@ -886,6 +891,27 @@ julia> public_api_names(SciMLTesting)
 function public_api_names(pkg::Module)
     api = filter!(!=(nameof(pkg)), names(pkg; all = false, imported = false))
     return sort!(api)
+end
+
+"""
+    public_reexports(pkg; allow = ()) -> Vector{Symbol}
+
+Return public bindings owned by another module. This is an opt-in QA audit: facade
+packages may allow deliberate reexports, while ordinary packages should expose only
+their own API.
+"""
+function public_reexports(pkg::Module; allow = ())
+    allowed = Set(Symbol.(allow))
+    return filter(public_api_names(pkg)) do name
+        name in allowed && return false
+        isdefined(pkg, name) || return false
+        owner = try
+            parentmodule(getfield(pkg, name))
+        catch
+            pkg
+        end
+        owner !== pkg
+    end
 end
 
 # Whether `pkg.name` resolves to a docstring. Uses `Base.Docs.doc` on the *binding*
