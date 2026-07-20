@@ -900,6 +900,14 @@ function _has_docstring(pkg::Module, name::Symbol)
     return !occursin("No documentation found", doc)
 end
 
+# A re-exported module is documented by its defining package. Rendering it locally with
+# Documenter's @docs pulls that dependency's complete docstring tree into this manual.
+function _requires_local_rendering(pkg::Module, name::Symbol)
+    isdefined(pkg, name) || return true
+    value = getfield(pkg, name)
+    return !(value isa Module && value !== pkg)
+end
+
 # The bare name referenced by one line inside a ```@docs``` fenced block. A `@docs`
 # entry is a name, optionally module-qualified and/or with a call signature, e.g.
 # `foo`, `MyPkg.foo`, `foo(x::Int)`, `MyPkg.@mac`. Take the first whitespace token,
@@ -979,8 +987,9 @@ Two checks, each its own nested `@testset`:
     not forced to redocument names it re-exports from a dependency.
   * **rendered** (`rendered = true`, on by default): every public API name appears inside a
     ```` ```@docs ```` block somewhere under `docs_src`, so it is rendered in the
-    manual. Packages without a resolvable local manual must explicitly set
-    `rendered = false`. If any
+    manual. Re-exported modules are documented by their defining package, because
+    rendering one locally pulls its complete docstring tree into the manual. Packages
+    without a resolvable local manual must explicitly set `rendered = false`. If any
     ```` ```@autodocs ```` block is present the check passes wholesale — `@autodocs`
     renders whole modules, so anything with a docstring is already rendered.
 
@@ -1042,8 +1051,10 @@ function run_api_docs(
         if rendered
             (rendered_names, autodocs) = _rendered_doc_names(docs_src)
             skip = Set{Symbol}(Symbol.(rendered_ignore))
-            unrendered = autodocs ? Symbol[] :
-                sort!(filter(n -> !(n in skip) && !(n in rendered_names), api))
+            unrendered = autodocs ? Symbol[] : sort!(filter(
+                n -> _requires_local_rendering(pkg, n) && !(n in skip) && !(n in rendered_names),
+                api,
+            ))
             @testset "public API is rendered in docs" begin
                 rendered_broken ? (@test_broken isempty(unrendered)) :
                     (@test isempty(unrendered))

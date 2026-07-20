@@ -94,6 +94,11 @@ module ApiFixture
     undocumented_public(x) = x
 end
 
+module ModuleReexportFixture
+    import SciMLTesting
+    export SciMLTesting
+end
+
 # A minimal AbstractTestSet that just collects every recorded result (including
 # nested testsets) and NEVER throws on finish. Wrapping a run_qa call in one lets a
 # test inspect the Broken/Pass/Fail/Error counts a broken-marker produced without
@@ -1017,6 +1022,15 @@ end
             )
         end
         @test c[:fail] == 0 && c[:pass] == 1
+
+        # A re-exported module is documented by its defining package. Documenter
+        # cannot render it locally without pulling in that package's full manual.
+        rroot = mktempdir()
+        rsrc = joinpath(rroot, "src"); mkpath(rsrc)
+        c = counts_of() do
+            run_api_docs(ModuleReexportFixture; docstrings = false, docs_src = rsrc)
+        end
+        @test c[:fail] == 0 && c[:error] == 0 && c[:pass] == 1
 
         # An @autodocs block satisfies the rendered check wholesale (no per-name list).
         adroot = mktempdir()
