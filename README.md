@@ -51,7 +51,7 @@ test = ["Test", "SciMLTesting", ...]
 | `activate_group_env(group_dir; parent, develop, instantiate, develop_sources)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. |
 | `develop_sources!(group_dir; parent)` | On Julia < 1.11, `Pkg.develop` the env's `[sources]` path graph (recursively); a no-op on 1.11+. |
 | `run_qa(pkg; Aqua, JET, ExplicitImports, aqua, jet, explicit_imports, api_docs, aqua_broken, jet_broken, ei_broken, ...)` | Run the standard Aqua/JET/ExplicitImports QA body, plus the public-API documentation check. Aqua + ExplicitImports come from SciMLTesting's deps (always available; `aqua` on by default, `explicit_imports` opt-in); `using JET` registers JET via its weakdep extension and turns the JET check on; `api_docs` is **on by default** and runs `run_api_docs` (configure via `api_docs_kwargs`, or `api_docs = false` to skip). The `*_broken` kwargs mark known-broken findings as `@test_broken` (see [Known-broken findings](#known-broken-findings-aqua_broken-jet_broken-ei_broken)). |
-| `run_api_docs(pkg; docstrings = true, rendered = false, docs_src, ignore, rendered_ignore, docstrings_broken, rendered_broken)` | Assert every exported/`public` name of `pkg` has a docstring (and, opt-in, is rendered in a `@docs` block under `docs/src`). The shared replacement for per-repo `test/QA/public_api_docs.jl` files. |
+| `run_api_docs(pkg; docstrings = true, rendered = true, docs_src, ignore, rendered_ignore, docstrings_broken, rendered_broken)` | Assert every exported/`public` name of `pkg` has a docstring and is rendered in a `@docs` block under `docs/src`. The shared replacement for per-repo `test/QA/public_api_docs.jl` files. |
 | `public_api_names(pkg)` | The sorted public API of `pkg` (exported names, plus `public` names on Julia ≥ 1.11), with the module's own name dropped. |
 | `detect_sublibrary_group(group, lib_dir; default_group = "Core")` | Map a `GROUP` value to a `(sublibrary, test_group)` pair for a monorepo. |
 
@@ -317,7 +317,7 @@ Several SciML repos had grown a hand-copied `test/QA/public_api_docs.jl` asserti
 every exported name has a docstring (and is rendered in the manual). `run_api_docs`
 replaces those per-repo files with one shared, maintained helper. It runs **by default
 inside `run_qa`** (`api_docs = true`), so a plain `run_qa(MyPackage)` already enforces
-the docstring check — configure it with `api_docs_kwargs`, or pass `api_docs = false` to
+the docstring and rendered-manual checks — configure it with `api_docs_kwargs`, or pass `api_docs = false` to
 skip:
 
 ```julia
@@ -326,22 +326,22 @@ using SciMLTesting, MyPackage
 # In the QA body — the docstring check runs by default:
 run_qa(MyPackage; explicit_imports = true)
 
-# Also require each public name is rendered in a docs/src @docs block:
-run_qa(MyPackage; explicit_imports = true, api_docs_kwargs = (; rendered = true))
+# A package without a local manual can explicitly opt out of rendered checks:
+run_qa(MyPackage; explicit_imports = true, api_docs_kwargs = (; rendered = false))
 
 # Standalone (outside run_qa), e.g. as its own QA file:
-run_api_docs(MyPackage)                    # every exported/`public` name has a docstring
-run_api_docs(MyPackage; rendered = true)   # also require each is in a docs/src @docs block
+run_api_docs(MyPackage)                     # every public name has a docstring and is rendered
+run_api_docs(MyPackage; rendered = false)   # docstrings only
 ```
 
   * **`docstrings`** (default `true`) — every name in `public_api_names(pkg)` has a
     docstring. A re-exported name documented in its defining package counts as
     documented (the check follows the binding), so you are not forced to redocument
     dependency re-exports.
-  * **`rendered`** (default `false`, opt-in) — every public name appears in a
+  * **`rendered`** (default `true`) — every public name appears in a
     ` ```@docs ` block under `docs_src` (defaults to `<pkgroot>/docs/src`). A
-    ` ```@autodocs ` block satisfies it wholesale. Opt-in because not every repo has a
-    resolvable local manual (monorepos with shared docs, packages with no manual).
+    ` ```@autodocs ` block satisfies it wholesale. Packages without a resolvable local
+    manual must explicitly pass `rendered = false`.
   * **`ignore` / `rendered_ignore`** — names to exclude (e.g. an un-documentable
     re-export), with a comment pointing at the tracking issue.
   * **`docstrings_broken` / `rendered_broken`** — mark the check `@test_broken` for a

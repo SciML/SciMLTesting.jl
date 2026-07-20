@@ -25,8 +25,8 @@ single declarative call. The reserved `"All"` group is the curated subset a bare
 full suite (including QA and `in_all = false` groups) for agents and long local runs.
 
 The same QA aggregator also owns the public-API *documentation* check: [`run_api_docs`](@ref)
-asserts every exported/`public` name has a docstring (and, opt-in, is rendered in the
-manual). It runs by default inside [`run_qa`](@ref) (`api_docs = true`), so repos drop
+asserts every exported/`public` name has a docstring and is rendered in the manual.
+It runs by default inside [`run_qa`](@ref) (`api_docs = true`), so repos drop
 their hand-rolled `test/QA/public_api_docs.jl` and get the check for free from a plain
 `run_qa(MyPkg)`.
 
@@ -633,8 +633,8 @@ Each tool runs if it is both available and enabled:
   * `ExplicitImports` + `explicit_imports` ⇒ ExplicitImports' standard + public-API
     checks (see [`run_explicit_imports`](@ref)).
   * `api_docs` ⇒ the public-API documentation check (see [`run_api_docs`](@ref)): every
-    exported/`public` name has a docstring (and, if `api_docs_kwargs` opts in with
-    `rendered = true`, is rendered in the manual).
+    exported/`public` name has a docstring and is rendered in the manual unless
+    `api_docs_kwargs` explicitly sets `rendered = false`.
 
 Enable-flag defaults: `aqua` defaults to `Aqua !== nothing` (on — Aqua is always
 available; pass `Aqua = nothing` or `aqua = false` to skip it), and `jet` defaults to
@@ -957,7 +957,7 @@ _default_docs_src(pkg::Module) =
     (root = pkgdir(pkg); root === nothing ? "" : joinpath(root, "docs", "src"))
 
 """
-    run_api_docs(pkg::Module; docstrings = true, rendered = false,
+    run_api_docs(pkg::Module; docstrings = true, rendered = true,
                  docs_src = <pkgroot>/docs/src,
                  ignore = (), rendered_ignore = (),
                  docstrings_broken = false, rendered_broken = false,
@@ -1006,8 +1006,8 @@ version — no per-repo `if VERSION` guards needed.
 ```julia
 # In test/qa/qa.jl — the whole per-repo public-API-docs check:
 using SciMLTesting, MyPackage
-run_api_docs(MyPackage)                       # docstrings only
-run_api_docs(MyPackage; rendered = true)      # also require rendering in docs/src
+run_api_docs(MyPackage)                       # docstrings and rendering in docs/src
+run_api_docs(MyPackage; rendered = false)     # docstrings only
 
 # It runs by default inside run_qa; use api_docs_kwargs to configure it, or
 # api_docs = false to skip it:
@@ -1020,7 +1020,7 @@ See also [`run_qa`](@ref), whose `api_docs`/`api_docs_kwargs` keywords call this
 function run_api_docs(
         pkg::Module;
         docstrings::Bool = true,
-        rendered::Bool = false,
+        rendered::Bool = true,
         docs_src::AbstractString = _default_docs_src(pkg),
         ignore = (),
         rendered_ignore = (),

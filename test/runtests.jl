@@ -893,7 +893,7 @@ end
 
         # The fixture has undocumented public API -> one Fail (the docstrings @test).
         c = counts_of() do
-            run_api_docs(ApiFixture)
+            run_api_docs(ApiFixture; rendered = false)
         end
         @test c[:fail] == 1
         @test c[:broken] == 0
@@ -901,14 +901,18 @@ end
         # Ignoring the undocumented names makes it pass. (:undocumented_public is not in
         # the API on 1.10, so ignoring it there is a harmless no-op.)
         c = counts_of() do
-            run_api_docs(ApiFixture; ignore = (:undocumented_fn, :undocumented_public))
+            run_api_docs(
+                ApiFixture;
+                rendered = false,
+                ignore = (:undocumented_fn, :undocumented_public),
+            )
         end
         @test c[:fail] == 0 && c[:error] == 0
         @test c[:pass] == 1
 
         # docstrings_broken records Broken while names remain undocumented (migration).
         c = counts_of() do
-            run_api_docs(ApiFixture; docstrings_broken = true)
+            run_api_docs(ApiFixture; rendered = false, docstrings_broken = true)
         end
         @test c[:broken] == 1
         @test c[:fail] == 0
@@ -916,7 +920,7 @@ end
         # A fully-documented API under docstrings_broken is an Unexpected Pass (Error),
         # auto-flagging the caller to drop the flag.
         c = counts_of() do
-            run_api_docs(SciMLTesting; docstrings_broken = true)
+            run_api_docs(SciMLTesting; rendered = false, docstrings_broken = true)
         end
         @test c[:error] == 1
         @test c[:broken] == 0
@@ -959,7 +963,7 @@ end
             "# API\n\n```@docs\n" * join(("ApiFixture." * String(n) for n in api), "\n") * "\n```\n",
         )
         c = counts_of() do
-            run_api_docs(ApiFixture; docstrings = false, rendered = true, docs_src = src)
+            run_api_docs(ApiFixture; docstrings = false, docs_src = src)
         end
         @test c[:fail] == 0 && c[:error] == 0
         @test c[:pass] == 1
