@@ -894,7 +894,7 @@ included when they are re-exported with `export`, since `names` reports them.
 
 ```julia
 julia> public_api_names(SciMLTesting)
-11-element Vector{Symbol}:
+13-element Vector{Symbol}:
  :activate_group_env
  ⋮
 ```

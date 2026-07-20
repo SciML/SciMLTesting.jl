@@ -918,8 +918,10 @@ end
         # SciMLTesting's own exported API is exactly what `export` lists (it declares
         # no `public` names), independent of Julia version.
         st = public_api_names(SciMLTesting)
+        @test length(st) == 13
         @test :run_api_docs in st && :run_qa in st && :run_tests in st
         @test :run_everything in st
+        @test :public_reexports in st
         @test !(:SciMLTesting in st)
     end
 
