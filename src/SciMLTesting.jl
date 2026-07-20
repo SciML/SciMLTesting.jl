@@ -609,10 +609,10 @@ end
 """
     run_qa(pkg; Aqua = Aqua, JET = ..., ExplicitImports = ExplicitImports,
            aqua = Aqua !== nothing, jet = JET !== nothing,
-           explicit_imports = true, api_docs = true,
+           explicit_imports = true, api_docs = true, check_reexports = false,
            clean_sources = true,
            aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
-           ei_kwargs = (;), api_docs_kwargs = (;),
+           ei_kwargs = (;), api_docs_kwargs = (;), reexports_allow = (),
            aqua_broken = (), jet_broken = false, ei_broken = (),
            testset = "Quality Assurance")
 
@@ -633,8 +633,10 @@ Each tool runs if it is both available and enabled:
   * `ExplicitImports` + `explicit_imports` ⇒ ExplicitImports' standard + public-API
     checks (see [`run_explicit_imports`](@ref)).
   * `api_docs` ⇒ the public-API documentation check (see [`run_api_docs`](@ref)): every
-    exported/`public` name has a docstring and is rendered in the manual unless
-    `api_docs_kwargs` explicitly sets `rendered = false`.
+    exported/`public` name has a docstring and every locally rendered name appears in
+    the manual unless `api_docs_kwargs` explicitly sets `rendered = false`.
+  * `check_reexports` ⇒ fail when the package publicly exposes a binding or alias
+    owned outside its module hierarchy, except names listed in `reexports_allow`.
 
 Enable-flag defaults: `aqua` defaults to `Aqua !== nothing` (on — Aqua is always
 available; pass `Aqua = nothing` or `aqua = false` to skip it), and `jet` defaults to
@@ -723,6 +725,10 @@ run_qa(MyPackage)
 using SciMLTesting, MyPackage
 run_qa(MyPackage)
 
+# Reject accidental public reexports. Facade packages can allow intentional names:
+run_qa(MyPackage; check_reexports = true)
+run_qa(MyFacade; check_reexports = true, reexports_allow = (:solve, :remake))
+
 # Explicitly threading the modules in still works (backward-compatible):
 using SciMLTesting, Aqua, JET
 run_qa(MyPackage; Aqua = Aqua, JET = JET, jet = true)
@@ -795,8 +801,13 @@ function run_qa(
         end
         explicit_imports && run_explicit_imports(pkg, ExplicitImports; ei_kwargs, ei_broken)
         api_docs && run_api_docs(pkg; api_docs_kwargs...)
-        check_reexports && @testset "No unapproved public reexports" begin
-            @test isempty(public_reexports(pkg; allow = reexports_allow))
+        if check_reexports
+            reexported = public_reexports(pkg; allow = reexports_allow)
+            @testset "No unapproved public reexports" begin
+                @test isempty(reexported)
+                isempty(reexported) ||
+                    @info "run_qa: unapproved public reexports" pkg reexported
+            end
         end
     end
     return nothing
@@ -896,22 +907,52 @@ end
 """
     public_reexports(pkg; allow = ()) -> Vector{Symbol}
 
-Return public bindings owned by another module. This is an opt-in QA audit: facade
-packages may allow deliberate reexports, while ordinary packages should expose only
-their own API.
+Return public names imported from, or aliased to API owned outside, `pkg`'s module
+hierarchy. This is an opt-in QA audit: facade packages may allow deliberate reexports,
+while ordinary packages should expose only their own API.
+
+`allow` is a collection of public names that are intentional reexports. Imported
+bindings are detected regardless of value kind. Local aliases are also detected when
+their values expose module ownership, including ordinary functions, declared types,
+and modules. Julia does not retain source-binding provenance for assigned scalar or
+enum values, callable objects, or constructed `Union` types; import those bindings
+directly when they must be covered by this audit.
+
+# Examples
+
+```julia
+public_reexports(MyPackage)
+public_reexports(MyFacade; allow = (:solve, :remake))
+```
 """
 function public_reexports(pkg::Module; allow = ())
     allowed = Set(Symbol.(allow))
-    return filter(public_api_names(pkg)) do name
+    reexported = filter(public_api_names(pkg)) do name
         name in allowed && return false
         isdefined(pkg, name) || return false
-        owner = try
+        binding_owner = try
+            which(pkg, name)
+        catch
+            pkg
+        end
+        !_is_within_module(binding_owner, pkg) && return true
+        value_owner = try
             parentmodule(getfield(pkg, name))
         catch
             pkg
         end
-        owner !== pkg
+        return !_is_within_module(value_owner, pkg)
     end
+    return sort!(reexported)
+end
+
+function _is_within_module(candidate::Module, root::Module)
+    while candidate !== root
+        parent = parentmodule(candidate)
+        parent === candidate && return false
+        candidate = parent
+    end
+    return true
 end
 
 # Whether `pkg.name` resolves to a docstring. Uses `Base.Docs.doc` on the *binding*
@@ -926,18 +967,13 @@ function _has_docstring(pkg::Module, name::Symbol)
     return !occursin("No documentation found", doc)
 end
 
-# A re-exported callable, type, or module is documented by its defining package.
-# Rendering it locally with Documenter's @docs pulls that dependency's API tree into
-# this manual. Values with no owning module still require local rendering.
+# A re-exported module inherits its defining package's module documentation.
+# Re-exported functions and types still require an explicit local API entry.
 function _requires_local_rendering(pkg::Module, name::Symbol)
     isdefined(pkg, name) || return true
     value = getfield(pkg, name)
-    owner = try
-        parentmodule(value)
-    catch
-        return true
-    end
-    return owner === pkg
+    value isa Module || return true
+    return _is_within_module(value, pkg)
 end
 
 # The bare name referenced by one line inside a ```@docs``` fenced block. A `@docs`
@@ -1019,9 +1055,9 @@ Two checks, each its own nested `@testset`:
     not forced to redocument names it re-exports from a dependency.
   * **rendered** (`rendered = true`, on by default): every public API name appears inside a
     ```` ```@docs ```` block somewhere under `docs_src`, so it is rendered in the
-    manual. Re-exported modules are documented by their defining package, because
-    rendering one locally pulls its complete docstring tree into the manual. Packages
-    without a resolvable local manual must explicitly set `rendered = false`. If any
+    manual. Re-exported modules inherit the defining package's rendered module
+    documentation, while re-exported functions and types still require a local entry.
+    Packages without a resolvable local manual must explicitly set `rendered = false`. If any
     ```` ```@autodocs ```` block is present the check passes wholesale — `@autodocs`
     renders whole modules, so anything with a docstring is already rendered.
 
