@@ -27,8 +27,8 @@ single declarative call. The reserved `"All"` group is the curated subset a bare
 full suite (including QA and `in_all = false` groups) for agents and long local runs.
 
 The same QA aggregator also owns the public-API *documentation* check: [`run_api_docs`](@ref)
-asserts every exported/`public` name has a docstring (and, opt-in, is rendered in the
-manual). It runs by default inside [`run_qa`](@ref) (`api_docs = true`), so repos drop
+asserts every exported/`public` name has a docstring and is rendered in the manual.
+It runs by default inside [`run_qa`](@ref) (`api_docs = true`), so repos drop
 their hand-rolled `test/QA/public_api_docs.jl` and get the check for free from a plain
 `run_qa(MyPkg)`.
 
@@ -58,7 +58,7 @@ import REPL
 
 export current_group, activate_group_env, run_qa, run_explicit_imports, detect_sublibrary_group,
     develop_sources!, run_tests, run_everything, read_test_groups,
-    with_clean_persistent_tasks_sources, run_api_docs, public_api_names
+    with_clean_persistent_tasks_sources, run_api_docs, public_api_names, public_reexports
 
 # Group names that are never sublibraries and never named functional groups: the
 # routing keywords `run_tests` and `detect_sublibrary_group` reserve.
@@ -630,10 +630,10 @@ end
 """
     run_qa(pkg; Aqua = Aqua, JET = ..., ExplicitImports = ExplicitImports,
            aqua = Aqua !== nothing, jet = JET !== nothing,
-           explicit_imports = false, api_docs = true,
+           explicit_imports = true, api_docs = true, check_reexports = false,
            clean_sources = true,
            aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
-           ei_kwargs = (;), api_docs_kwargs = (;),
+           ei_kwargs = (;), api_docs_kwargs = (;), reexports_allow = (),
            aqua_broken = (), jet_broken = false, ei_broken = (),
            testset = "Quality Assurance")
 
@@ -645,7 +645,7 @@ list them as test dependencies. `JET` is the exception: it is compiler-version-p
 and so is kept a *weak* dependency, loaded only on demand. `using JET` in your
 `test/qa/qa.jl` triggers `SciMLTesting`'s JET extension, which auto-registers the
 module; `run_qa` then picks it up. The typical call collapses to just
-`run_qa(MyPkg; explicit_imports = true, ei_kwargs = ...)`.
+`run_qa(MyPkg; ei_kwargs = ...)`.
 
 Each tool runs if it is both available and enabled:
 
@@ -654,8 +654,10 @@ Each tool runs if it is both available and enabled:
   * `ExplicitImports` + `explicit_imports` ⇒ ExplicitImports' standard + public-API
     checks (see [`run_explicit_imports`](@ref)).
   * `api_docs` ⇒ the public-API documentation check (see [`run_api_docs`](@ref)): every
-    exported/`public` name has a docstring (and, if `api_docs_kwargs` opts in with
-    `rendered = true`, is rendered in the manual).
+    exported/`public` name has a docstring and every locally rendered name appears in
+    the manual unless `api_docs_kwargs` explicitly sets `rendered = false`.
+  * `check_reexports` ⇒ fail when the package publicly exposes a binding or alias
+    owned outside its module hierarchy, except names listed in `reexports_allow`.
 
 Enable-flag defaults: `aqua` defaults to `Aqua !== nothing` (on — Aqua is always
 available; pass `Aqua = nothing` or `aqua = false` to skip it), and `jet` defaults to
@@ -665,9 +667,9 @@ QA expectation across the fleet, so it runs for every `run_qa` caller by default
 document a repo's public API, or curate exceptions via `api_docs_kwargs` (`ignore`,
 `docstrings_broken`), or pass `api_docs = false` to skip it. `api_docs_kwargs` is
 forwarded to [`run_api_docs`](@ref) (e.g. `rendered`, `ignore`, `docstrings_broken`).
-`explicit_imports` still defaults to **`false`** — its per-repo-curated ignore-lists make
-it a deliberate opt-in (`explicit_imports = true`). Setting an enable flag `true` while
-its module is unavailable is a configuration error and throws an `ArgumentError`. The
+`explicit_imports` defaults to **`true`**. Packages with unavoidable dependency
+exceptions provide their per-check ignore-lists through `ei_kwargs`. Setting an enable
+flag `true` while its module is unavailable is a configuration error and throws an `ArgumentError`. The
 whole thing runs inside a `@testset` named `testset`.
 
 `clean_sources` (default `true`) wraps the `Aqua.test_all` call in
@@ -733,16 +735,20 @@ pre-1.6 behavior.
 # per-repo qa.jl collapses to `explicit_imports = true` plus the genuinely per-repo
 # kwargs (the ignore-lists). Aqua + ExplicitImports both run here:
 using SciMLTesting, MyPackage
-run_qa(MyPackage; explicit_imports = true,
+run_qa(MyPackage;
     ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_dep_name,))))
 
 # Add the JET check by `using JET` (its weakdep extension auto-registers it):
 using SciMLTesting, JET, MyPackage
-run_qa(MyPackage; explicit_imports = true)
+run_qa(MyPackage)
 
 # Aqua only — leave `explicit_imports` at its default and don't load JET:
 using SciMLTesting, MyPackage
 run_qa(MyPackage)
+
+# Reject accidental public reexports. Facade packages can allow intentional names:
+run_qa(MyPackage; check_reexports = true)
+run_qa(MyFacade; check_reexports = true, reexports_allow = (:solve, :remake))
 
 # Explicitly threading the modules in still works (backward-compatible):
 using SciMLTesting, Aqua, JET
@@ -751,7 +757,7 @@ run_qa(MyPackage; Aqua = Aqua, JET = JET, jet = true)
 # A repo with a tracked Aqua ambiguities finding, JET known-broken, and one EI check
 # known-broken — preserve the suppressions while converting its hand-rolled qa.jl:
 using SciMLTesting, JET, MyPackage
-run_qa(MyPackage; explicit_imports = true,
+run_qa(MyPackage;
     aqua_broken = (:ambiguities,),   # placeholder: remove when the issue closes
     jet_broken = true,               # auto-flags Unexpected Pass once JET is clean
     ei_broken = (:no_implicit_imports,))  # auto-flags once the check passes
@@ -764,8 +770,10 @@ function run_qa(
         ExplicitImports = ExplicitImports,
         aqua::Bool = Aqua !== nothing,
         jet::Bool = JET !== nothing,
-        explicit_imports::Bool = false,
+        explicit_imports::Bool = true,
         api_docs::Bool = true,
+        check_reexports::Bool = false,
+        reexports_allow = (),
         clean_sources::Bool = true,
         aqua_kwargs = (;),
         jet_kwargs = (; target_modules = (pkg,), mode = :typo),
@@ -814,6 +822,14 @@ function run_qa(
         end
         explicit_imports && run_explicit_imports(pkg, ExplicitImports; ei_kwargs, ei_broken)
         api_docs && run_api_docs(pkg; api_docs_kwargs...)
+        if check_reexports
+            reexported = public_reexports(pkg; allow = reexports_allow)
+            @testset "No unapproved public reexports" begin
+                @test isempty(reexported)
+                isempty(reexported) ||
+                    @info "run_qa: unapproved public reexports" pkg reexported
+            end
+        end
     end
     return nothing
 end
@@ -899,7 +915,7 @@ included when they are re-exported with `export`, since `names` reports them.
 
 ```julia
 julia> public_api_names(SciMLTesting)
-11-element Vector{Symbol}:
+13-element Vector{Symbol}:
  :activate_group_env
  ⋮
 ```
@@ -907,6 +923,57 @@ julia> public_api_names(SciMLTesting)
 function public_api_names(pkg::Module)
     api = filter!(!=(nameof(pkg)), names(pkg; all = false, imported = false))
     return sort!(api)
+end
+
+"""
+    public_reexports(pkg; allow = ()) -> Vector{Symbol}
+
+Return public names imported from, or aliased to API owned outside, `pkg`'s module
+hierarchy. This is an opt-in QA audit: facade packages may allow deliberate reexports,
+while ordinary packages should expose only their own API.
+
+`allow` is a collection of public names that are intentional reexports. Imported
+bindings are detected regardless of value kind. Local aliases are also detected when
+their values expose module ownership, including ordinary functions, declared types,
+and modules. Julia does not retain source-binding provenance for assigned scalar or
+enum values, callable objects, or constructed `Union` types; import those bindings
+directly when they must be covered by this audit.
+
+# Examples
+
+```julia
+public_reexports(MyPackage)
+public_reexports(MyFacade; allow = (:solve, :remake))
+```
+"""
+function public_reexports(pkg::Module; allow = ())
+    allowed = Set(Symbol.(allow))
+    reexported = filter(public_api_names(pkg)) do name
+        name in allowed && return false
+        isdefined(pkg, name) || return false
+        binding_owner = try
+            which(pkg, name)
+        catch
+            pkg
+        end
+        !_is_within_module(binding_owner, pkg) && return true
+        value_owner = try
+            parentmodule(getfield(pkg, name))
+        catch
+            pkg
+        end
+        return !_is_within_module(value_owner, pkg)
+    end
+    return sort!(reexported)
+end
+
+function _is_within_module(candidate::Module, root::Module)
+    while candidate !== root
+        parent = parentmodule(candidate)
+        parent === candidate && return false
+        candidate = parent
+    end
+    return true
 end
 
 # Whether `pkg.name` resolves to a docstring. Uses `Base.Docs.doc` on the *binding*
@@ -919,6 +986,15 @@ function _has_docstring(pkg::Module, name::Symbol)
     isdefined(pkg, name) || return false
     doc = sprint(show, MIME"text/plain"(), Base.Docs.doc(Base.Docs.Binding(pkg, name)))
     return !occursin("No documentation found", doc)
+end
+
+# A re-exported module inherits its defining package's module documentation.
+# Re-exported functions and types still require an explicit local API entry.
+function _requires_local_rendering(pkg::Module, name::Symbol)
+    isdefined(pkg, name) || return true
+    value = getfield(pkg, name)
+    value isa Module || return true
+    return _is_within_module(value, pkg)
 end
 
 # The bare name referenced by one line inside a ```@docs``` fenced block. A `@docs`
@@ -972,13 +1048,13 @@ end
 
 # Default docs source dir for a package: <pkgroot>/docs/src, or "" when the package
 # root cannot be located (e.g. `pkg` is `Main`). "" is a non-directory, so the
-# rendered scan finds nothing and the check fails loudly if it was opted into without
-# a resolvable docs tree.
+# rendered scan finds nothing and the default check fails loudly without a resolvable
+# docs tree.
 _default_docs_src(pkg::Module) =
     (root = pkgdir(pkg); root === nothing ? "" : joinpath(root, "docs", "src"))
 
 """
-    run_api_docs(pkg::Module; docstrings = true, rendered = false,
+    run_api_docs(pkg::Module; docstrings = true, rendered = true,
                  docs_src = <pkgroot>/docs/src,
                  ignore = (), rendered_ignore = (),
                  docstrings_broken = false, rendered_broken = false,
@@ -989,8 +1065,8 @@ Assert that `pkg`'s public API (see [`public_api_names`](@ref)) is documented.
 This is the shared, per-repo-free replacement for the hand-rolled
 `test/QA/public_api_docs.jl` files that were copied into individual SciML repos.
 [`run_qa`](@ref) runs it by default (`api_docs = true`), so a plain `run_qa(MyPkg)`
-already covers the docstring check; call `run_api_docs` directly only to run it outside
-`run_qa` or to opt into the `rendered` check.
+already covers both checks; call `run_api_docs` directly only to run it outside
+`run_qa` or to configure either check independently.
 
 Two checks, each its own nested `@testset`:
 
@@ -998,10 +1074,11 @@ Two checks, each its own nested `@testset`:
     docstring. A re-exported name documented in its defining package counts as
     documented (the check follows the binding, not a local docstring), so a repo is
     not forced to redocument names it re-exports from a dependency.
-  * **rendered** (`rendered = false`, opt-in): every public API name appears inside a
+  * **rendered** (`rendered = true`, on by default): every public API name appears inside a
     ```` ```@docs ```` block somewhere under `docs_src`, so it is rendered in the
-    manual. This is opt-in because it needs a resolvable docs tree and does not fit
-    every repo (monorepos with shared docs, packages with no manual). If any
+    manual. Re-exported modules inherit the defining package's rendered module
+    documentation, while re-exported functions and types still require a local entry.
+    Packages without a resolvable local manual must explicitly set `rendered = false`. If any
     ```` ```@autodocs ```` block is present the check passes wholesale — `@autodocs`
     renders whole modules, so anything with a docstring is already rendered.
 
@@ -1027,13 +1104,12 @@ version — no per-repo `if VERSION` guards needed.
 ```julia
 # In test/qa/qa.jl — the whole per-repo public-API-docs check:
 using SciMLTesting, MyPackage
-run_api_docs(MyPackage)                       # docstrings only
-run_api_docs(MyPackage; rendered = true)      # also require rendering in docs/src
+run_api_docs(MyPackage)                       # docstrings and rendering in docs/src
+run_api_docs(MyPackage; rendered = false)     # docstrings only
 
 # It runs by default inside run_qa; use api_docs_kwargs to configure it, or
 # api_docs = false to skip it:
-run_qa(MyPackage; explicit_imports = true,
-       api_docs_kwargs = (; rendered = true, ignore = (:reexported_from_dep,)))
+run_qa(MyPackage; api_docs_kwargs = (; ignore = (:reexported_from_dep,)))
 ```
 
 See also [`run_qa`](@ref), whose `api_docs`/`api_docs_kwargs` keywords call this.
@@ -1041,7 +1117,7 @@ See also [`run_qa`](@ref), whose `api_docs`/`api_docs_kwargs` keywords call this
 function run_api_docs(
         pkg::Module;
         docstrings::Bool = true,
-        rendered::Bool = false,
+        rendered::Bool = true,
         docs_src::AbstractString = _default_docs_src(pkg),
         ignore = (),
         rendered_ignore = (),
@@ -1064,8 +1140,12 @@ function run_api_docs(
         if rendered
             (rendered_names, autodocs) = _rendered_doc_names(docs_src)
             skip = Set{Symbol}(Symbol.(rendered_ignore))
-            unrendered = autodocs ? Symbol[] :
-                sort!(filter(n -> !(n in skip) && !(n in rendered_names), api))
+            unrendered = autodocs ? Symbol[] : sort!(
+                    filter(
+                        n -> _requires_local_rendering(pkg, n) && !(n in skip) && !(n in rendered_names),
+                        api,
+                    )
+                )
             @testset "public API is rendered in docs" begin
                 rendered_broken ? (@test_broken isempty(unrendered)) :
                     (@test isempty(unrendered))
