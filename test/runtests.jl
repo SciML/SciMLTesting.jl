@@ -1677,6 +1677,183 @@ end
         @test ran("core") && ran("light") && ran("qa")
     end
 
+    @testset "aggregate group environment isolation is opt in" begin
+        fixture = mktempdir()
+        scimltesting_root = dirname(@__DIR__)
+        probe_uuid = "ad8416e4-70cf-4e0a-8cd9-b2ec46a55d68"
+        upstream_uuid = "69f15684-0f9c-4957-a656-cd46984e9b39"
+        root_probe = joinpath(fixture, "probe_root")
+        group_probe = joinpath(fixture, "probe_group")
+        upstream_probe = joinpath(fixture, "upstream_probe")
+
+        function write_probe(path, marker, version)
+            mkpath(joinpath(path, "src"))
+            write(
+                joinpath(path, "Project.toml"),
+                """
+                name = "VersionProbe"
+                uuid = "$probe_uuid"
+                version = "$version"
+                """,
+            )
+            write(
+                joinpath(path, "src", "VersionProbe.jl"),
+                "module VersionProbe\nmarker() = $(repr(marker))\nend\n",
+            )
+        end
+        write_probe(root_probe, :root, v"1.0.0")
+        write_probe(group_probe, :group, v"2.0.0")
+        mkpath(joinpath(upstream_probe, "src"))
+        write(
+            joinpath(upstream_probe, "Project.toml"),
+            """
+            name = "UpstreamProbe"
+            uuid = "$upstream_uuid"
+            version = "1.0.0"
+            """,
+        )
+        write(
+            joinpath(upstream_probe, "src", "UpstreamProbe.jl"),
+            "module UpstreamProbe\nmarker() = :upstream\nend\n",
+        )
+
+        write(
+            joinpath(fixture, "Project.toml"),
+            """
+            name = "IsolationHarness"
+            uuid = "078b6e20-328a-4f6b-87bc-447dd10c05a7"
+            version = "1.0.0"
+
+            [deps]
+            SciMLTesting = "09d9d899-5365-40a9-917a-5f67fddea283"
+            UpstreamProbe = "$upstream_uuid"
+            VersionProbe = "$probe_uuid"
+            """,
+        )
+        test_dir = joinpath(fixture, "test")
+        group_dir = joinpath(test_dir, "other")
+        mkpath(group_dir)
+        write(
+            joinpath(group_dir, "Project.toml"),
+            """
+            [deps]
+            UpstreamProbe = "$upstream_uuid"
+            VersionProbe = "$probe_uuid"
+
+            [sources]
+            VersionProbe = {path = "../../probe_group"}
+            """,
+        )
+
+        core_pid = joinpath(test_dir, "core_pid")
+        group_pid = joinpath(test_dir, "group_pid")
+        group_options = joinpath(test_dir, "group_options")
+        core_file = joinpath(test_dir, "core.jl")
+        group_file = joinpath(group_dir, "body.jl")
+        write(
+            core_file,
+            "using VersionProbe\n@test VersionProbe.marker() === :root\n" *
+                "write($(repr(core_pid)), string(getpid()))\n",
+        )
+        write(
+            group_file,
+            "using UpstreamProbe, VersionProbe\n" *
+                "@test UpstreamProbe.marker() === :upstream\n" *
+                "@test VersionProbe.marker() === :group\n" *
+                "write($(repr(group_pid)), string(getpid()))\n" *
+                "write($(repr(group_options)), repr((Base.JLOptions().code_coverage, Base.JLOptions().depwarn, Base.JLOptions().check_bounds, Base.JLOptions().startupfile)))\n",
+        )
+        helper = joinpath(test_dir, "helper.jl")
+        write(
+            helper,
+            """
+            using SciMLTesting
+            function run_harness()
+                run_tests(;
+                    core = $(repr(core_file)),
+                    groups = Dict(
+                        "Other" => (;
+                            env = $(repr(group_dir)),
+                            parent = String[],
+                            body = $(repr(group_file)),
+                        ),
+                    ),
+                    all = ["Core", "Other"],
+                    isolate_group_environments = true,
+                )
+            end
+            """,
+        )
+        wrapper = joinpath(test_dir, "runtests.jl")
+        write(
+            wrapper,
+            "include($(repr(helper)))\nrun_harness()\n",
+        )
+
+        setup = """
+        using Pkg
+        Pkg.develop([
+            PackageSpec(path = $(repr(scimltesting_root))),
+            PackageSpec(path = $(repr(root_probe))),
+            PackageSpec(path = $(repr(upstream_probe))),
+        ])
+        Pkg.instantiate()
+        """
+        run(
+            addenv(
+                `$(Base.julia_cmd()) --project=$fixture -e $setup`,
+                "JULIA_PKG_PRECOMPILE_AUTO" => "0",
+            ),
+        )
+
+        default_env = joinpath(test_dir, "default_env")
+        mkpath(default_env)
+        write(joinpath(default_env, "Project.toml"), "")
+        default_core_pid = joinpath(test_dir, "default_core_pid")
+        default_group_pid = joinpath(test_dir, "default_group_pid")
+        default_core = joinpath(test_dir, "default_core.jl")
+        default_group = joinpath(test_dir, "default_group.jl")
+        write(default_core, "write($(repr(default_core_pid)), string(getpid()))\n")
+        write(default_group, "write($(repr(default_group_pid)), string(getpid()))\n")
+        default_wrapper = joinpath(test_dir, "default_runtests.jl")
+        write(
+            default_wrapper,
+            """
+            using SciMLTesting
+            run_tests(;
+                core = $(repr(default_core)),
+                groups = Dict(
+                    "Other" => (;
+                        env = $(repr(default_env)),
+                        parent = String[],
+                        body = $(repr(default_group)),
+                    ),
+                ),
+                all = ["Core", "Other"],
+            )
+            """,
+        )
+        run(
+            addenv(
+                `$(Base.julia_cmd()) --project=$fixture $default_wrapper`,
+                "GROUP" => "All",
+                "JULIA_PKG_PRECOMPILE_AUTO" => "0",
+            ),
+        )
+        @test read(default_core_pid, String) == read(default_group_pid, String)
+
+        run(
+            addenv(
+                `$(Base.julia_cmd()) --code-coverage=user --depwarn=error --check-bounds=yes --startup-file=no --project=$fixture $wrapper`,
+                "GROUP" => "All",
+                "JULIA_PKG_PRECOMPILE_AUTO" => "0",
+            ),
+        )
+
+        @test read(core_pid, String) != read(group_pid, String)
+        @test read(group_options, String) == "(1, 2, 1, 2)"
+    end
+
     @testset "run_tests umbrella groups" begin
         # Extension 3: an umbrella key expands to >= 2 member groups, each run in
         # turn. Selecting the umbrella runs all members; selecting a member alone
@@ -1846,6 +2023,18 @@ end
         end
         @test ran("a_core") && ran("b_core")  # both top-level files ran
         # runtests.jl not run (no error thrown) and subdir not recursed (no error).
+
+        rm(joinpath(tdir, "ran_a_core"))
+        rm(joinpath(tdir, "ran_b_core"))
+        project = dirname(Base.active_project())
+        code = "using SciMLTesting; run_tests(; test_dir = $(repr(tdir)))"
+        run(
+            addenv(
+                `$(Base.julia_cmd()) --project=$project -e $code`,
+                "GROUP" => "Core",
+            ),
+        )
+        @test ran("a_core") && ran("b_core")
     end
 
     @testset "run_tests folder mode: named group runs ALL its files (enforced)" begin
