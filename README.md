@@ -251,8 +251,9 @@ them; all default to the v1.0.0 behavior, so existing callers are unchanged.
   * **`isolate_group_environments`** — default `false`. When `true`, a group that
     declares an `env` and is selected through `"All"`, `"Everything"`, or an umbrella
     runs in a fresh Julia process. The child re-enters the test entrypoint with the
-    member group selected and preserves the active test project plus Julia flags
-    such as coverage, depwarn, bounds checking, and startup-file settings.
+    member group selected, develops path-tracked packages from the active test
+    project unless the group declares its own source for that package, and preserves
+    Julia flags such as coverage, depwarn, bounds checking, and startup-file settings.
 
 ```julia
 # complex monorepo root test/runtests.jl

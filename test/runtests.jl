@@ -1443,8 +1443,10 @@ end
         fixture = mktempdir()
         scimltesting_root = dirname(@__DIR__)
         probe_uuid = "ad8416e4-70cf-4e0a-8cd9-b2ec46a55d68"
+        upstream_uuid = "69f15684-0f9c-4957-a656-cd46984e9b39"
         root_probe = joinpath(fixture, "probe_root")
         group_probe = joinpath(fixture, "probe_group")
+        upstream_probe = joinpath(fixture, "upstream_probe")
 
         function write_probe(path, marker, version)
             mkpath(joinpath(path, "src"))
@@ -1463,6 +1465,19 @@ end
         end
         write_probe(root_probe, :root, v"1.0.0")
         write_probe(group_probe, :group, v"2.0.0")
+        mkpath(joinpath(upstream_probe, "src"))
+        write(
+            joinpath(upstream_probe, "Project.toml"),
+            """
+            name = "UpstreamProbe"
+            uuid = "$upstream_uuid"
+            version = "1.0.0"
+            """,
+        )
+        write(
+            joinpath(upstream_probe, "src", "UpstreamProbe.jl"),
+            "module UpstreamProbe\nmarker() = :upstream\nend\n",
+        )
 
         write(
             joinpath(fixture, "Project.toml"),
@@ -1473,6 +1488,7 @@ end
 
             [deps]
             SciMLTesting = "09d9d899-5365-40a9-917a-5f67fddea283"
+            UpstreamProbe = "$upstream_uuid"
             VersionProbe = "$probe_uuid"
             """,
         )
@@ -1483,6 +1499,7 @@ end
             joinpath(group_dir, "Project.toml"),
             """
             [deps]
+            UpstreamProbe = "$upstream_uuid"
             VersionProbe = "$probe_uuid"
 
             [sources]
@@ -1502,7 +1519,9 @@ end
         )
         write(
             group_file,
-            "using VersionProbe\n@test VersionProbe.marker() === :group\n" *
+            "using UpstreamProbe, VersionProbe\n" *
+                "@test UpstreamProbe.marker() === :upstream\n" *
+                "@test VersionProbe.marker() === :group\n" *
                 "write($(repr(group_pid)), string(getpid()))\n" *
                 "write($(repr(group_options)), repr((Base.JLOptions().code_coverage, Base.JLOptions().depwarn, Base.JLOptions().check_bounds, Base.JLOptions().startupfile)))\n",
         )
@@ -1538,6 +1557,7 @@ end
         Pkg.develop([
             PackageSpec(path = $(repr(scimltesting_root))),
             PackageSpec(path = $(repr(root_probe))),
+            PackageSpec(path = $(repr(upstream_probe))),
         ])
         Pkg.instantiate()
         """

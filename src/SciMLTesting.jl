@@ -64,6 +64,7 @@ export current_group, activate_group_env, run_qa, run_explicit_imports, detect_s
 # routing keywords `run_tests` and `detect_sublibrary_group` reserve.
 # "Everything" is the uncurated full-suite aggregate (see `run_tests` / `run_everything`).
 const RESERVED_GROUPS = ("All", "Core", "QA", "Everything")
+const _ISOLATED_GROUP_PROCESS_ENV = "SCIMLTESTING_ISOLATED_GROUP_PROCESS"
 
 # Registry of optional (weakdep) QA tool modules, populated by a package extension
 # in `__init__` when the user `using`s the tool. Only `JET` is registered this way;
@@ -403,6 +404,7 @@ function activate_group_env(
         instantiate::Bool = true,
         develop_sources::Bool = true,
     )
+    isolated_parent_paths = develop ? _isolated_group_parent_paths(group_dir) : String[]
     Pkg.activate(group_dir)
     parents = parent isa AbstractString ? (parent,) : parent
     # On Julia < 1.11 `[sources]` is ignored, so develop the parent(s) (the
@@ -419,6 +421,7 @@ function activate_group_env(
     # natively, so only the parent(s) are developed (develop_sources! is a no-op).
     if develop
         paths = collect(AbstractString, parents)
+        append!(paths, isolated_parent_paths)
         if develop_sources && VERSION < v"1.11"
             append!(paths, _collect_source_paths(group_dir))
         end
@@ -429,6 +432,22 @@ function activate_group_env(
     end
     instantiate && Pkg.instantiate()
     return nothing
+end
+
+# Keep path-developed upstream packages from the outer test sandbox in an isolated
+# group, while treating the group's own `[sources]` entries as authoritative.
+function _isolated_group_parent_paths(group_dir::AbstractString)
+    get(ENV, _ISOLATED_GROUP_PROCESS_ENV, "") == "true" || return String[]
+
+    project_file = _project_file(group_dir)
+    parsed = project_file === nothing ? Dict{String, Any}() : TOML.parsefile(project_file)
+    group_sources = Set{String}(keys(get(parsed, "sources", Dict{String, Any}())))
+    tracked = [
+        (info.name, info.source) for info in values(Pkg.dependencies())
+            if info.is_tracking_path && !(info.name in group_sources)
+    ]
+    sort!(tracked; by = first)
+    return last.(tracked)
 end
 
 # Build `Pkg.develop` specs for a list of project directories, dropping duplicate
@@ -1259,7 +1278,11 @@ function _run_group_subprocess(group::AbstractString, env::AbstractString)
     cmd = Base.julia_cmd()
     project_file === nothing || (cmd = `$cmd --project=$(dirname(project_file))`)
     @info "Running environment-backed test group in a fresh Julia process" group
-    run(addenv(`$cmd $file`, env => group))
+    run(
+        addenv(
+            `$cmd $file`, env => group, _ISOLATED_GROUP_PROCESS_ENV => "true"
+        )
+    )
     return nothing
 end
 
@@ -1521,7 +1544,9 @@ behavior is unchanged from v1.1.x unless `isolate_group_environments = true`.
     environment-backed member selected through `"All"`, `"Everything"`, or an
     umbrella runs in a fresh Julia process. This prevents packages loaded from an
     earlier environment from being combined with source from the newly activated
-    environment. The child preserves the active test project and Julia flags.
+    environment. The child preserves the active test project's path-tracked
+    packages unless its group environment declares its own source for that package,
+    and preserves the active Julia flags.
 
 # Routing (explicit-args mode)
 
