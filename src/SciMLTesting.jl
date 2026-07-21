@@ -56,7 +56,7 @@ import REPL
 
 export current_group, activate_group_env, run_qa, run_explicit_imports, detect_sublibrary_group,
     develop_sources!, run_tests, run_everything, read_test_groups,
-    with_clean_persistent_tasks_sources, run_api_docs, public_api_names
+    with_clean_persistent_tasks_sources, run_api_docs, public_api_names, public_reexports
 
 # Group names that are never sublibraries and never named functional groups: the
 # routing keywords `run_tests` and `detect_sublibrary_group` reserve.
@@ -609,10 +609,10 @@ end
 """
     run_qa(pkg; Aqua = Aqua, JET = ..., ExplicitImports = ExplicitImports,
            aqua = Aqua !== nothing, jet = JET !== nothing,
-           explicit_imports = true, api_docs = true,
+           explicit_imports = true, api_docs = true, check_reexports = false,
            clean_sources = true,
            aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
-           ei_kwargs = (;), api_docs_kwargs = (;),
+           ei_kwargs = (;), api_docs_kwargs = (;), reexports_allow = (),
            aqua_broken = (), jet_broken = false, ei_broken = (),
            testset = "Quality Assurance")
 
@@ -633,8 +633,10 @@ Each tool runs if it is both available and enabled:
   * `ExplicitImports` + `explicit_imports` ⇒ ExplicitImports' standard + public-API
     checks (see [`run_explicit_imports`](@ref)).
   * `api_docs` ⇒ the public-API documentation check (see [`run_api_docs`](@ref)): every
-    exported/`public` name has a docstring and is rendered in the manual unless
-    `api_docs_kwargs` explicitly sets `rendered = false`.
+    exported/`public` name has a docstring and every locally rendered name appears in
+    the manual unless `api_docs_kwargs` explicitly sets `rendered = false`.
+  * `check_reexports` ⇒ fail when the package publicly exposes a binding or alias
+    owned outside its module hierarchy, except names listed in `reexports_allow`.
 
 Enable-flag defaults: `aqua` defaults to `Aqua !== nothing` (on — Aqua is always
 available; pass `Aqua = nothing` or `aqua = false` to skip it), and `jet` defaults to
@@ -723,6 +725,10 @@ run_qa(MyPackage)
 using SciMLTesting, MyPackage
 run_qa(MyPackage)
 
+# Reject accidental public reexports. Facade packages can allow intentional names:
+run_qa(MyPackage; check_reexports = true)
+run_qa(MyFacade; check_reexports = true, reexports_allow = (:solve, :remake))
+
 # Explicitly threading the modules in still works (backward-compatible):
 using SciMLTesting, Aqua, JET
 run_qa(MyPackage; Aqua = Aqua, JET = JET, jet = true)
@@ -745,6 +751,8 @@ function run_qa(
         jet::Bool = JET !== nothing,
         explicit_imports::Bool = true,
         api_docs::Bool = true,
+        check_reexports::Bool = false,
+        reexports_allow = (),
         clean_sources::Bool = true,
         aqua_kwargs = (;),
         jet_kwargs = (; target_modules = (pkg,), mode = :typo),
@@ -793,6 +801,14 @@ function run_qa(
         end
         explicit_imports && run_explicit_imports(pkg, ExplicitImports; ei_kwargs, ei_broken)
         api_docs && run_api_docs(pkg; api_docs_kwargs...)
+        if check_reexports
+            reexported = public_reexports(pkg; allow = reexports_allow)
+            @testset "No unapproved public reexports" begin
+                @test isempty(reexported)
+                isempty(reexported) ||
+                    @info "run_qa: unapproved public reexports" pkg reexported
+            end
+        end
     end
     return nothing
 end
@@ -878,7 +894,7 @@ included when they are re-exported with `export`, since `names` reports them.
 
 ```julia
 julia> public_api_names(SciMLTesting)
-11-element Vector{Symbol}:
+13-element Vector{Symbol}:
  :activate_group_env
  ⋮
 ```
@@ -886,6 +902,57 @@ julia> public_api_names(SciMLTesting)
 function public_api_names(pkg::Module)
     api = filter!(!=(nameof(pkg)), names(pkg; all = false, imported = false))
     return sort!(api)
+end
+
+"""
+    public_reexports(pkg; allow = ()) -> Vector{Symbol}
+
+Return public names imported from, or aliased to API owned outside, `pkg`'s module
+hierarchy. This is an opt-in QA audit: facade packages may allow deliberate reexports,
+while ordinary packages should expose only their own API.
+
+`allow` is a collection of public names that are intentional reexports. Imported
+bindings are detected regardless of value kind. Local aliases are also detected when
+their values expose module ownership, including ordinary functions, declared types,
+and modules. Julia does not retain source-binding provenance for assigned scalar or
+enum values, callable objects, or constructed `Union` types; import those bindings
+directly when they must be covered by this audit.
+
+# Examples
+
+```julia
+public_reexports(MyPackage)
+public_reexports(MyFacade; allow = (:solve, :remake))
+```
+"""
+function public_reexports(pkg::Module; allow = ())
+    allowed = Set(Symbol.(allow))
+    reexported = filter(public_api_names(pkg)) do name
+        name in allowed && return false
+        isdefined(pkg, name) || return false
+        binding_owner = try
+            which(pkg, name)
+        catch
+            pkg
+        end
+        !_is_within_module(binding_owner, pkg) && return true
+        value_owner = try
+            parentmodule(getfield(pkg, name))
+        catch
+            pkg
+        end
+        return !_is_within_module(value_owner, pkg)
+    end
+    return sort!(reexported)
+end
+
+function _is_within_module(candidate::Module, root::Module)
+    while candidate !== root
+        parent = parentmodule(candidate)
+        parent === candidate && return false
+        candidate = parent
+    end
+    return true
 end
 
 # Whether `pkg.name` resolves to a docstring. Uses `Base.Docs.doc` on the *binding*
@@ -898,6 +965,15 @@ function _has_docstring(pkg::Module, name::Symbol)
     isdefined(pkg, name) || return false
     doc = sprint(show, MIME"text/plain"(), Base.Docs.doc(Base.Docs.Binding(pkg, name)))
     return !occursin("No documentation found", doc)
+end
+
+# A re-exported module inherits its defining package's module documentation.
+# Re-exported functions and types still require an explicit local API entry.
+function _requires_local_rendering(pkg::Module, name::Symbol)
+    isdefined(pkg, name) || return true
+    value = getfield(pkg, name)
+    value isa Module || return true
+    return _is_within_module(value, pkg)
 end
 
 # The bare name referenced by one line inside a ```@docs``` fenced block. A `@docs`
@@ -979,8 +1055,9 @@ Two checks, each its own nested `@testset`:
     not forced to redocument names it re-exports from a dependency.
   * **rendered** (`rendered = true`, on by default): every public API name appears inside a
     ```` ```@docs ```` block somewhere under `docs_src`, so it is rendered in the
-    manual. Packages without a resolvable local manual must explicitly set
-    `rendered = false`. If any
+    manual. Re-exported modules inherit the defining package's rendered module
+    documentation, while re-exported functions and types still require a local entry.
+    Packages without a resolvable local manual must explicitly set `rendered = false`. If any
     ```` ```@autodocs ```` block is present the check passes wholesale — `@autodocs`
     renders whole modules, so anything with a docstring is already rendered.
 
@@ -1042,8 +1119,12 @@ function run_api_docs(
         if rendered
             (rendered_names, autodocs) = _rendered_doc_names(docs_src)
             skip = Set{Symbol}(Symbol.(rendered_ignore))
-            unrendered = autodocs ? Symbol[] :
-                sort!(filter(n -> !(n in skip) && !(n in rendered_names), api))
+            unrendered = autodocs ? Symbol[] : sort!(
+                    filter(
+                        n -> _requires_local_rendering(pkg, n) && !(n in skip) && !(n in rendered_names),
+                        api,
+                    )
+                )
             @testset "public API is rendered in docs" begin
                 rendered_broken ? (@test_broken isempty(unrendered)) :
                     (@test isempty(unrendered))

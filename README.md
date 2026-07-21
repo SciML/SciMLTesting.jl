@@ -50,9 +50,10 @@ test = ["Test", "SciMLTesting", ...]
 | `current_group(; env = "GROUP", default = "All")` | Read the test-group env var, defaulting to `"All"` (empty string also normalizes to the default). |
 | `activate_group_env(group_dir; parent, develop, instantiate, develop_sources)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. |
 | `develop_sources!(group_dir; parent)` | On Julia < 1.11, `Pkg.develop` the env's `[sources]` path graph (recursively); a no-op on 1.11+. |
-| `run_qa(pkg; Aqua, JET, ExplicitImports, aqua, jet, explicit_imports, api_docs, aqua_broken, jet_broken, ei_broken, ...)` | Run the standard Aqua/JET/ExplicitImports QA body, plus the public-API documentation check. Aqua and ExplicitImports run by default; `using JET` registers JET via its weakdep extension and turns the JET check on. `api_docs` is **on by default** and runs `run_api_docs`. The `*_broken` kwargs mark known-broken findings as `@test_broken`. |
-| `run_api_docs(pkg; docstrings = true, rendered = true, docs_src, ignore, rendered_ignore, docstrings_broken, rendered_broken)` | Assert every exported/`public` name of `pkg` has a docstring and is rendered in a `@docs` block under `docs/src`. The shared replacement for per-repo `test/QA/public_api_docs.jl` files. |
+| `run_qa(pkg; Aqua, JET, ExplicitImports, aqua, jet, explicit_imports, api_docs, check_reexports, aqua_broken, jet_broken, ei_broken, ...)` | Run the standard Aqua/JET/ExplicitImports QA body, plus the public-API documentation check. Aqua and ExplicitImports run by default; `using JET` registers JET via its weakdep extension and turns the JET check on. `api_docs` is **on by default** and runs `run_api_docs`. `check_reexports` is opt-in and rejects public dependency bindings except `reexports_allow`. The `*_broken` kwargs mark known-broken findings as `@test_broken`. |
+| `run_api_docs(pkg; docstrings = true, rendered = true, docs_src, ignore, rendered_ignore, docstrings_broken, rendered_broken)` | Assert every exported/`public` name of `pkg` has a docstring and every locally rendered name appears in a `@docs` block under `docs/src`. Re-exported dependency modules inherit their defining package's rendering. |
 | `public_api_names(pkg)` | The sorted public API of `pkg` (exported names, plus `public` names on Julia ≥ 1.11), with the module's own name dropped. |
+| `public_reexports(pkg; allow = ())` | Public names imported from outside the package module hierarchy, plus aliases with reflectable external module ownership, excluding intentional names in `allow`. |
 | `detect_sublibrary_group(group, lib_dir; default_group = "Core")` | Map a `GROUP` value to a `(sublibrary, test_group)` pair for a monorepo. |
 
 All are documented with full docstrings; `?run_tests` etc. at the REPL.
@@ -330,7 +331,7 @@ run_qa(MyPackage)
 run_qa(MyPackage; api_docs_kwargs = (; rendered = false))
 
 # Standalone (outside run_qa), e.g. as its own QA file:
-run_api_docs(MyPackage)                     # every public name has a docstring and is rendered
+run_api_docs(MyPackage)                     # every public name is documented
 run_api_docs(MyPackage; rendered = false)   # docstrings only
 ```
 
@@ -338,10 +339,10 @@ run_api_docs(MyPackage; rendered = false)   # docstrings only
     docstring. A re-exported name documented in its defining package counts as
     documented (the check follows the binding), so you are not forced to redocument
     dependency re-exports.
-  * **`rendered`** (default `true`) — every public name appears in a
-    ` ```@docs ` block under `docs_src` (defaults to `<pkgroot>/docs/src`). A
-    ` ```@autodocs ` block satisfies it wholesale. Packages without a resolvable local
-    manual must explicitly pass `rendered = false`.
+  * **`rendered`** (default `true`) — every public name except re-exported dependency
+    modules appears in a ` ```@docs ` block under `docs_src` (defaults to
+    `<pkgroot>/docs/src`). A ` ```@autodocs ` block satisfies it wholesale. Packages
+    without a resolvable local manual must explicitly pass `rendered = false`.
   * **`ignore` / `rendered_ignore`** — names to exclude (e.g. an un-documentable
     re-export), with a comment pointing at the tracking issue.
   * **`docstrings_broken` / `rendered_broken`** — mark the check `@test_broken` for a
@@ -349,6 +350,21 @@ run_api_docs(MyPackage; rendered = false)   # docstrings only
 
 On the Julia 1.10 LTS `public_api_names` returns only the exported names (the `public`
 keyword is 1.11+), so no per-repo `if VERSION` guards are needed.
+
+### Public reexport audit (`check_reexports = true`)
+
+The reexport audit is opt-in so adopting this SciMLTesting release does not immediately
+break existing facade packages. Enable it while cleaning each package's public surface:
+
+```julia
+run_qa(MyPackage; check_reexports = true)
+run_qa(MyFacade; check_reexports = true, reexports_allow = (:solve, :remake))
+```
+
+It detects imported functions, types, modules, scalar constants, macros, and operators.
+It also detects local aliases when their values expose module ownership, such as
+ordinary functions, declared types, and modules. Keep `reexports_allow` limited to
+deliberate facade API; ordinary packages should use qualified dependency names instead.
 
 ### Known-broken findings (`aqua_broken`, `jet_broken`, `ei_broken`)
 

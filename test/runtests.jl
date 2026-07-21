@@ -94,6 +94,86 @@ module ApiFixture
     undocumented_public(x) = x
 end
 
+module ModuleReexportFixture
+    import SciMLTesting
+    export SciMLTesting
+end
+
+module FunctionReexportFixture
+    import SciMLTesting: run_qa
+    export run_qa
+end
+
+module ReexportOwnerFixture
+    export owned_function, OwnedType, OwnedModule, owned_scalar, @owned_macro
+    owned_function() = nothing
+    struct OwnedType end
+    module OwnedModule end
+    const owned_scalar = 42
+    macro owned_macro()
+        return nothing
+    end
+end
+
+module ComprehensiveReexportFixture
+    import ..ReexportOwnerFixture: owned_function, OwnedType, OwnedModule, owned_scalar
+    export owned_function, OwnedType, OwnedModule, owned_scalar, local_function,
+        LocalType, local_scalar
+    local_function() = nothing
+    struct LocalType end
+    const local_scalar = 7
+end
+
+module AliasReexportFixture
+    import ..ReexportOwnerFixture
+    const aliased_function = ReexportOwnerFixture.owned_function
+    const AliasedType = ReexportOwnerFixture.OwnedType
+    const AliasedModule = ReexportOwnerFixture.OwnedModule
+    export aliased_function, AliasedType, AliasedModule
+end
+
+module MacroReexportFixture
+    import ..ReexportOwnerFixture: @owned_macro
+    export @owned_macro
+end
+
+module OperatorReexportFixture
+    import Base: +
+    export +
+end
+
+module UndefinedExportFixture
+    export undefined_name
+end
+
+module PublicOnlyReexportFixture
+    import ..ReexportOwnerFixture: owned_function
+    @static if VERSION >= v"1.11"
+        eval(Expr(:public, :owned_function))
+    end
+end
+
+module NestedOwnerFixture
+    module Internal
+        nested_function() = nothing
+        struct NestedType end
+        module NestedModule end
+        const nested_scalar = 11
+        var"-->"(x, y) = x
+        macro nested_macro()
+            return nothing
+        end
+    end
+    import .Internal: nested_function, NestedType, NestedModule, nested_scalar, -->,
+        @nested_macro
+    export nested_function, NestedType, NestedModule, nested_scalar, -->, @nested_macro
+end
+
+module LocalModuleFixture
+    module LocalSubmodule end
+    export LocalSubmodule
+end
+
 # A minimal AbstractTestSet that just collects every recorded result (including
 # nested testsets) and NEVER throws on finish. Wrapping a run_qa call in one lets a
 # test inspect the Broken/Pass/Fail/Error counts a broken-marker produced without
@@ -838,8 +918,10 @@ end
         # SciMLTesting's own exported API is exactly what `export` lists (it declares
         # no `public` names), independent of Julia version.
         st = public_api_names(SciMLTesting)
+        @test length(st) == 13
         @test :run_api_docs in st && :run_qa in st && :run_tests in st
         @test :run_everything in st
+        @test :public_reexports in st
         @test !(:SciMLTesting in st)
     end
 
@@ -851,6 +933,34 @@ end
         @test SciMLTesting._doc_entry_name("Base.SubMod.bar") == :bar
         @test SciMLTesting._doc_entry_name("@mac") == Symbol("@mac")
         @test SciMLTesting._doc_entry_name("MyPkg.@mac") == Symbol("@mac")
+    end
+
+    @testset "public_reexports" begin
+        @test public_reexports(ModuleReexportFixture) == [:SciMLTesting]
+        @test public_reexports(FunctionReexportFixture) == [:run_qa]
+        @test public_reexports(ComprehensiveReexportFixture) ==
+            [:OwnedModule, :OwnedType, :owned_function, :owned_scalar]
+        @test public_reexports(AliasReexportFixture) ==
+            [:AliasedModule, :AliasedType, :aliased_function]
+        @test public_reexports(MacroReexportFixture) == [Symbol("@owned_macro")]
+        @test isempty(public_reexports(MacroReexportFixture; allow = (Symbol("@owned_macro"),)))
+        @test public_reexports(OperatorReexportFixture) == [:+]
+        @test isempty(public_reexports(OperatorReexportFixture; allow = (:+,)))
+        @test isempty(public_reexports(UndefinedExportFixture))
+        @test isempty(public_reexports(LocalModuleFixture))
+        @test isempty(public_reexports(NestedOwnerFixture))
+        if VERSION >= v"1.11"
+            @test public_reexports(PublicOnlyReexportFixture) == [:owned_function]
+        else
+            @test isempty(public_reexports(PublicOnlyReexportFixture))
+        end
+        @test public_reexports(
+            ComprehensiveReexportFixture;
+            allow = (:OwnedModule, :OwnedType, :owned_function, :owned_scalar),
+        ) == Symbol[]
+        @test public_reexports(
+            ComprehensiveReexportFixture; allow = (:owned_scalar,),
+        ) == [:OwnedModule, :OwnedType, :owned_function]
     end
 
     @testset "_rendered_doc_names" begin
@@ -1018,6 +1128,31 @@ end
         end
         @test c[:fail] == 0 && c[:pass] == 1
 
+        # A re-exported module inherits its defining package's module documentation.
+        rroot = mktempdir()
+        rsrc = joinpath(rroot, "src"); mkpath(rsrc)
+        c = counts_of() do
+            run_api_docs(ModuleReexportFixture; docstrings = false, docs_src = rsrc)
+        end
+        @test c[:fail] == 0 && c[:error] == 0 && c[:pass] == 1
+        @test :SciMLTesting in public_api_names(ModuleReexportFixture)
+        @test !SciMLTesting._requires_local_rendering(ModuleReexportFixture, :SciMLTesting)
+
+        c = counts_of() do
+            run_api_docs(FunctionReexportFixture; docstrings = false, docs_src = rsrc)
+        end
+        @test c[:fail] == 1 && c[:error] == 0 && c[:pass] == 0
+        @test :run_qa in public_api_names(FunctionReexportFixture)
+        @test SciMLTesting._requires_local_rendering(FunctionReexportFixture, :run_qa)
+        @test SciMLTesting._requires_local_rendering(ComprehensiveReexportFixture, :OwnedType)
+        @test SciMLTesting._requires_local_rendering(NestedOwnerFixture, :NestedModule)
+
+        # A package-owned submodule remains part of this package's rendered manual.
+        c = counts_of() do
+            run_api_docs(LocalModuleFixture; docstrings = false, docs_src = rsrc)
+        end
+        @test c[:fail] == 1
+
         # An @autodocs block satisfies the rendered check wholesale (no per-name list).
         adroot = mktempdir()
         asrc = joinpath(adroot, "src"); mkpath(asrc)
@@ -1097,6 +1232,59 @@ end
             )
         end
         @test c[:pass] == 0 && c[:fail] == 0 && c[:error] == 0 && c[:broken] == 0
+    end
+
+    @testset "run_qa public reexport integration (opt in)" begin
+        function count_results(ts)
+            counts = Dict(:pass => 0, :fail => 0, :error => 0, :broken => 0)
+            for r in ts.results
+                if r isa Test.Pass
+                    counts[:pass] += 1
+                elseif r isa Test.Fail
+                    counts[:fail] += 1
+                elseif r isa Test.Error
+                    counts[:error] += 1
+                elseif r isa Test.Broken
+                    counts[:broken] += 1
+                elseif r isa Test.AbstractTestSet
+                    sub = count_results(r)
+                    for k in keys(counts)
+                        counts[k] += sub[k]
+                    end
+                end
+            end
+            return counts
+        end
+        counts_of(body) = count_results(
+            @testset ProbeTestSet "probe" begin
+                body()
+            end
+        )
+        qa_kwargs = (;
+            Aqua = nothing, JET = nothing, ExplicitImports = nothing,
+            explicit_imports = false, api_docs = false,
+        )
+
+        # Compatibility: the audit is off unless a package explicitly enables it.
+        c = counts_of() do
+            run_qa(ComprehensiveReexportFixture; qa_kwargs...)
+        end
+        @test c[:pass] == 0 && c[:fail] == 0 && c[:error] == 0
+
+        c = counts_of() do
+            run_qa(ComprehensiveReexportFixture; qa_kwargs..., check_reexports = true)
+        end
+        @test c[:fail] == 1 && c[:error] == 0
+
+        c = counts_of() do
+            run_qa(
+                ComprehensiveReexportFixture;
+                qa_kwargs...,
+                check_reexports = true,
+                reexports_allow = (:OwnedModule, :OwnedType, :owned_function, :owned_scalar),
+            )
+        end
+        @test c[:pass] == 1 && c[:fail] == 0 && c[:error] == 0
     end
 
     @testset "run_tests routing" begin
