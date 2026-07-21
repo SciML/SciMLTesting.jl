@@ -1229,12 +1229,13 @@ end
                 ExplicitImports = nothing,
                 explicit_imports = false,
                 api_docs = false,
+                check_reexports = false,
             )
         end
         @test c[:pass] == 0 && c[:fail] == 0 && c[:error] == 0 && c[:broken] == 0
     end
 
-    @testset "run_qa public reexport integration (opt in)" begin
+    @testset "run_qa public reexport integration (default on)" begin
         function count_results(ts)
             counts = Dict(:pass => 0, :fail => 0, :error => 0, :broken => 0)
             for r in ts.results
@@ -1265,22 +1266,23 @@ end
             explicit_imports = false, api_docs = false,
         )
 
-        # Compatibility: the audit is off unless a package explicitly enables it.
+        # The default path rejects every unapproved public reexport.
         c = counts_of() do
             run_qa(ComprehensiveReexportFixture; qa_kwargs...)
         end
-        @test c[:pass] == 0 && c[:fail] == 0 && c[:error] == 0
-
-        c = counts_of() do
-            run_qa(ComprehensiveReexportFixture; qa_kwargs..., check_reexports = true)
-        end
         @test c[:fail] == 1 && c[:error] == 0
 
+        # The enable flag still has an explicit diagnostic escape hatch.
+        c = counts_of() do
+            run_qa(ComprehensiveReexportFixture; qa_kwargs..., check_reexports = false)
+        end
+        @test c[:pass] == 0 && c[:fail] == 0 && c[:error] == 0
+
+        # Intentional facade API passes only when every reexport is listed.
         c = counts_of() do
             run_qa(
                 ComprehensiveReexportFixture;
                 qa_kwargs...,
-                check_reexports = true,
                 reexports_allow = (:OwnedModule, :OwnedType, :owned_function, :owned_scalar),
             )
         end
