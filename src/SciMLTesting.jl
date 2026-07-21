@@ -630,7 +630,7 @@ end
 """
     run_qa(pkg; Aqua = Aqua, JET = ..., ExplicitImports = ExplicitImports,
            aqua = Aqua !== nothing, jet = JET !== nothing,
-           explicit_imports = true, api_docs = true, check_reexports = false,
+           explicit_imports = true, api_docs = true, check_reexports = true,
            clean_sources = true,
            aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
            ei_kwargs = (;), api_docs_kwargs = (;), reexports_allow = (),
@@ -667,8 +667,9 @@ QA expectation across the fleet, so it runs for every `run_qa` caller by default
 document a repo's public API, or curate exceptions via `api_docs_kwargs` (`ignore`,
 `docstrings_broken`), or pass `api_docs = false` to skip it. `api_docs_kwargs` is
 forwarded to [`run_api_docs`](@ref) (e.g. `rendered`, `ignore`, `docstrings_broken`).
-`explicit_imports` defaults to **`true`**. Packages with unavoidable dependency
-exceptions provide their per-check ignore-lists through `ei_kwargs`. Setting an enable
+`explicit_imports` and `check_reexports` default to **`true`**. Packages with unavoidable
+dependency exceptions provide their per-check ignore-lists through `ei_kwargs`, while
+facade packages list intentional public reexports in `reexports_allow`. Setting an enable
 flag `true` while its module is unavailable is a configuration error and throws an `ArgumentError`. The
 whole thing runs inside a `@testset` named `testset`.
 
@@ -746,9 +747,8 @@ run_qa(MyPackage)
 using SciMLTesting, MyPackage
 run_qa(MyPackage)
 
-# Reject accidental public reexports. Facade packages can allow intentional names:
-run_qa(MyPackage; check_reexports = true)
-run_qa(MyFacade; check_reexports = true, reexports_allow = (:solve, :remake))
+# Public reexports are rejected by default. Facade packages allow intentional names:
+run_qa(MyFacade; reexports_allow = (:solve, :remake))
 
 # Explicitly threading the modules in still works (backward-compatible):
 using SciMLTesting, Aqua, JET
@@ -772,7 +772,7 @@ function run_qa(
         jet::Bool = JET !== nothing,
         explicit_imports::Bool = true,
         api_docs::Bool = true,
-        check_reexports::Bool = false,
+        check_reexports::Bool = true,
         reexports_allow = (),
         clean_sources::Bool = true,
         aqua_kwargs = (;),
@@ -929,8 +929,8 @@ end
     public_reexports(pkg; allow = ()) -> Vector{Symbol}
 
 Return public names imported from, or aliased to API owned outside, `pkg`'s module
-hierarchy. This is an opt-in QA audit: facade packages may allow deliberate reexports,
-while ordinary packages should expose only their own API.
+hierarchy. [`run_qa`](@ref) runs this audit by default: facade packages allow deliberate
+reexports, while ordinary packages should expose only their own API.
 
 `allow` is a collection of public names that are intentional reexports. Imported
 bindings are detected regardless of value kind. Local aliases are also detected when
