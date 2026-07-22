@@ -1128,7 +1128,8 @@ end
         end
         @test c[:fail] == 0 && c[:pass] == 1
 
-        # A re-exported module inherits its defining package's module documentation.
+        # External reexports are checked by public_reexports, not the local rendered
+        # API-doc requirement.
         rroot = mktempdir()
         rsrc = joinpath(rroot, "src"); mkpath(rsrc)
         c = counts_of() do
@@ -1141,10 +1142,10 @@ end
         c = counts_of() do
             run_api_docs(FunctionReexportFixture; docstrings = false, docs_src = rsrc)
         end
-        @test c[:fail] == 1 && c[:error] == 0 && c[:pass] == 0
+        @test c[:fail] == 0 && c[:error] == 0 && c[:pass] == 1
         @test :run_qa in public_api_names(FunctionReexportFixture)
-        @test SciMLTesting._requires_local_rendering(FunctionReexportFixture, :run_qa)
-        @test SciMLTesting._requires_local_rendering(ComprehensiveReexportFixture, :OwnedType)
+        @test !SciMLTesting._requires_local_rendering(FunctionReexportFixture, :run_qa)
+        @test !SciMLTesting._requires_local_rendering(ComprehensiveReexportFixture, :OwnedType)
         @test SciMLTesting._requires_local_rendering(NestedOwnerFixture, :NestedModule)
 
         # A package-owned submodule remains part of this package's rendered manual.
