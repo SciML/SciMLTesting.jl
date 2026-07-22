@@ -967,13 +967,23 @@ function _has_docstring(pkg::Module, name::Symbol)
     return !occursin("No documentation found", doc)
 end
 
-# A re-exported module inherits its defining package's module documentation.
-# Re-exported functions and types still require an explicit local API entry.
+# Only names owned by this package's module hierarchy require a local rendered API
+# entry. External public reexports are audited separately by `public_reexports`.
 function _requires_local_rendering(pkg::Module, name::Symbol)
     isdefined(pkg, name) || return true
+    binding_owner = try
+        which(pkg, name)
+    catch
+        pkg
+    end
+    _is_within_module(binding_owner, pkg) || return false
     value = getfield(pkg, name)
-    value isa Module || return true
-    return _is_within_module(value, pkg)
+    owner = try
+        value isa Module ? value : parentmodule(value)
+    catch
+        pkg
+    end
+    return _is_within_module(owner, pkg)
 end
 
 # The bare name referenced by one line inside a ```@docs``` fenced block. A `@docs`
