@@ -520,9 +520,7 @@ end
 ```
 
 See also [`run_qa`](@ref), which wraps its `Aqua.test_all` call in this helper by
-default (`clean_sources = true`) and, inside the same wrap, runs the persistent-tasks
-check through a race-tolerant retry (`_has_persistent_tasks_with_retry`) instead of
-Aqua's single-shot `Aqua.test_persistent_tasks`.
+default (`clean_sources = true`).
 """
 function with_clean_persistent_tasks_sources(f; verbose::Bool = false)
     backups = _strip_broken_sources!(; verbose = verbose)
@@ -667,21 +665,6 @@ removed. Set `clean_sources = false` to opt out (e.g. on Julia < 1.11, where the
 does not apply; the wrap is a cheap no-op there since no installed `[sources]` paths
 are broken in a single-package checkout, but the flag makes the intent explicit).
 
-The persistent-tasks check itself runs through a **race-tolerant retry**
-(`_has_persistent_tasks_with_retry`) rather than Aqua's built-in single-shot
-`Aqua.test_persistent_tasks` (which is disabled in the `Aqua.test_all` call). Aqua's
-probe cold-precompiles a throwaway wrapper of `pkg` in a subprocess; on a large
-dependency graph that parallel precompile intermittently trips Julia's `<module> is
-missing from the cache … may be precompilable after restarting julia` race, so the
-subprocess exits before loading the wrapper and Aqua misreports it as a persistent
-task (JuliaTesting/Aqua.jl#315). The retry re-runs the wrapper precompile when it
-exits without writing its `done.log` sentinel; precompilation stays parallel, so the
-retry recompiles only the few modules the race left uncached. The genuine check is
-unchanged — a real persistent task loads fine and then holds the process open past
-`tmax`, which is still detected. It runs as a `@testset "persistent_tasks (retry)"`
-inside the same `clean_sources` wrapper, and is skipped when persistent-tasks is opted
-out (named in `aqua_broken`, or `persistent_tasks = false` in `aqua_kwargs`).
-
 This replaces the per-repo `qa.jl`/`jet.jl` bodies that all call
 `Aqua.test_all(pkg)` and `JET.test_package(pkg; target_modules = (pkg,), mode = :typo)`.
 
@@ -794,31 +777,14 @@ function run_qa(
             # Disable each known-broken sub-check in the Aqua.test_all call (the
             # broken-disable wins over any aqua_kwargs entry) and emit a tracked
             # placeholder per name. Merge order puts the `name => false` pairs last so
-            # they override a same-named aqua_kwargs entry. Aqua's built-in single-shot
-            # persistent-tasks check is always disabled here; run_qa runs a race-tolerant
-            # retry version (`_has_persistent_tasks_with_retry`) below instead, unless
-            # persistent-tasks is opted out.
-            effective_aqua_kwargs = merge(
-                NamedTuple(aqua_kwargs),
-                _aqua_broken_disable(aqua_broken),
-                (; persistent_tasks = false),
-            )
-            # Opt out of the retry when persistent-tasks is named in `aqua_broken` (its
-            # broken-marker is emitted in the loop below) or explicitly disabled via
-            # `persistent_tasks = false` in `aqua_kwargs`.
-            persistent_tasks_opted_out =
-                (:persistent_tasks in Symbol.(aqua_broken)) ||
-                (get(NamedTuple(aqua_kwargs), :persistent_tasks, nothing) === false)
+            # they override a same-named aqua_kwargs entry.
+            effective_aqua_kwargs = isempty(aqua_broken) ? aqua_kwargs :
+                merge(NamedTuple(aqua_kwargs), _aqua_broken_disable(aqua_broken))
             run_aqua = () -> begin
                 Aqua.test_all(pkg; effective_aqua_kwargs...)
                 for name in aqua_broken
                     @testset "aqua: $(name) (broken)" begin
                         @test_broken false
-                    end
-                end
-                if !persistent_tasks_opted_out
-                    @testset "persistent_tasks (retry)" begin
-                        @test !_has_persistent_tasks_with_retry(pkg)
                     end
                 end
                 nothing
@@ -850,83 +816,6 @@ end
 # Build the `(; name => false, ...)` NamedTuple that disables each named Aqua
 # sub-check when merged over `aqua_kwargs`.
 _aqua_broken_disable(names) = NamedTuple{Tuple(Symbol.(names))}(ntuple(_ -> false, length(names)))
-
-# Race-tolerant persistent-tasks probe used by `run_qa` in place of Aqua's built-in
-# single-shot `Aqua.test_persistent_tasks`. Aqua's probe spawns a throwaway wrapper
-# package that `using`s `pkg` and, from inside the precompilation process, writes a
-# `done.log` sentinel; a package that never lets that process exit within `tmax` is
-# reported as holding a persistent `Task`. When the wrapper's freshly resolved
-# dependency set precompiles cold and in parallel, one module can hit a *retryable*
-# "missing from the cache" precompile race, so the child exits without writing
-# `done.log` and the check misreports it as a persistent task (JuliaTesting/Aqua.jl#315).
-# An immediate second precompile finds the now-warm cache and succeeds.
-#
-# This faithfully reproduces Aqua's wrapper (its public API only exposes the
-# single-shot `Aqua.test_persistent_tasks`) but retries when the child precompile
-# exits without writing `done.log`. Precompilation stays parallel, so the retry
-# recompiles only the few modules the race left uncached (fast); forcing serial
-# precompilation instead would dodge the race but write `done.log` far more than
-# `tmax` before the slow serial precompile finishes, tripping the process-exit check.
-# A genuine persistent task is unaffected: it writes `done.log` and then keeps the
-# process alive past `tmax`, which this still detects, so the retry cannot mask a real
-# background task. Returns `true` when `pkg` holds a persistent task (or the wrapper
-# never precompiled after `retries` attempts), `false` otherwise.
-function _has_persistent_tasks_with_retry(pkg::Module; tmax = 10, retries = 3)
-    pkgname = string(nameof(pkg))
-    pkgpath = pkgdir(pkg)
-    prev_project = Base.active_project()::String
-    isdefined(Pkg, :respect_sysimage_versions) && Pkg.respect_sysimage_versions(false)
-    try
-        for attempt in 1:retries
-            wrapperdir = tempname()
-            wrappername, _ = only(Pkg.generate(wrapperdir; io = devnull))
-            Pkg.activate(wrapperdir; io = devnull)
-            Pkg.develop(Pkg.PackageSpec(path = pkgpath); io = devnull)
-            statusfile = joinpath(wrapperdir, "done.log")
-            open(joinpath(wrapperdir, "src", wrappername * ".jl"), "w") do io
-                println(
-                    io,
-                    """
-                    module $wrappername
-                    using $pkgname
-                    open("$(escape_string(statusfile))", "w") do io
-                        println(io, "done")
-                        flush(io)
-                    end
-                    end
-                    """,
-                )
-            end
-            cmd = `$(Base.julia_cmd()) --project=$wrapperdir -e 'push!(LOAD_PATH, "@stdlib"); using Pkg; Pkg.precompile()'`
-            proc = run(cmd, stdin, stdout, stderr; wait = false)
-            while !isfile(statusfile) && process_running(proc)
-                sleep(0.5)
-            end
-            if !isfile(statusfile)
-                # Child precompile exited without loading the wrapper: the retryable
-                # cold-cache race. Retry with a fresh wrapper; the next precompile hits
-                # the now-warm cache. Only give up after `retries` attempts.
-                if attempt < retries
-                    @info "SciMLTesting: persistent-tasks wrapper precompile exited without writing done.log; retrying" pkg attempt retries
-                    continue
-                end
-                @error "SciMLTesting: persistent-tasks wrapper precompile never produced done.log after $retries attempts" pkg
-                return true
-            end
-            t = time()
-            while process_running(proc) && time() - t < tmax
-                sleep(0.1)
-            end
-            exited = !process_running(proc)
-            exited || kill(proc, Base.SIGKILL)
-            return !exited
-        end
-        return true
-    finally
-        isdefined(Pkg, :respect_sysimage_versions) && Pkg.respect_sysimage_versions(true)
-        Pkg.activate(prev_project; io = devnull)
-    end
-end
 
 # `JET.report_package` is report-only and takes JET config keys via `jetconfigs...`
 # (target_modules / target_defined_modules / ignored_modules / ...). It does NOT have
