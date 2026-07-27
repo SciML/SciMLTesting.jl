@@ -993,6 +993,30 @@ end
         @test isempty(empty_rendered) && empty_auto == false
     end
 
+    @testset "_find_docs_src" begin
+        repository = mktempdir()
+        package_root = joinpath(repository, "lib", "ApiFixture")
+        mkpath(package_root)
+        repository_docs = joinpath(repository, "docs", "src")
+        mkpath(repository_docs)
+        write(
+            joinpath(repository, "Project.toml"),
+            "[sources]\nApiFixture = {path = \"lib/ApiFixture\"}\n",
+        )
+        @test SciMLTesting._find_docs_src(package_root, "ApiFixture") == repository_docs
+
+        write(
+            joinpath(repository, "Project.toml"),
+            "[sources]\nOtherPackage = {path = \"lib/ApiFixture\"}\n",
+        )
+        @test SciMLTesting._find_docs_src(package_root, "ApiFixture") ==
+            joinpath(package_root, "docs", "src")
+
+        package_docs = joinpath(package_root, "docs", "src")
+        mkpath(package_docs)
+        @test SciMLTesting._find_docs_src(package_root, "ApiFixture") == package_docs
+    end
+
     @testset "run_api_docs docstrings check" begin
         # Reuse the ProbeTestSet + count_results helpers from the broken-markers set to
         # count Pass/Fail/Broken without failing the enclosing suite.
