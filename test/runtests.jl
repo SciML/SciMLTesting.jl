@@ -94,6 +94,16 @@ module ApiFixture
     undocumented_public(x) = x
 end
 
+module EnumFixture
+    module Generated
+        @enum T first second
+    end
+
+    module Ordinary
+        const T = Int
+    end
+end
+
 module ModuleReexportFixture
     import SciMLTesting
     export SciMLTesting
@@ -642,6 +652,19 @@ end
             ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))),
         )
         @test FakeExplicitImports.PUBLIC_CALLED[] == (VERSION >= v"1.11")
+    end
+
+    @testset "generated enum modules are excluded from source analysis" begin
+        @test SciMLTesting._generated_enum_modules(EnumFixture) == (EnumFixture.Generated,)
+        kwargs = SciMLTesting._explicit_imports_kwargs(
+            EnumFixture,
+            :no_implicit_imports,
+            (; no_implicit_imports = (; allow_unanalyzable = (ApiFixture,))),
+        )
+        @test kwargs.allow_unanalyzable == (ApiFixture, EnumFixture.Generated)
+        @test SciMLTesting._explicit_imports_kwargs(
+            EnumFixture, :all_qualified_accesses_are_public, (;)
+        ) == NamedTuple()
     end
 
     @testset "run_qa enable-flag defaulting" begin

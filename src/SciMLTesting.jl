@@ -826,6 +826,29 @@ function _jet_report_kwargs(jet_kwargs)
     return haskey(nt, :mode) ? Base.structdiff(nt, NamedTuple{(:mode,)}) : nt
 end
 
+function _generated_enum_modules(pkg::Module)
+    modules = Module[]
+    for name in names(pkg; all = true, imported = false)
+        isdefined(pkg, name) || continue
+        child = getfield(pkg, name)
+        child isa Module && parentmodule(child) === pkg || continue
+        isdefined(child, :T) || continue
+        T = getfield(child, :T)
+        T isa DataType && T <: Enum || continue
+        push!(modules, child)
+    end
+    return Tuple(modules)
+end
+
+function _explicit_imports_kwargs(pkg::Module, name::Symbol, ei_kwargs)
+    kwargs = NamedTuple(get(ei_kwargs, name, (;)))
+    name in (:no_implicit_imports, :no_stale_explicit_imports) || return kwargs
+    generated_enums = _generated_enum_modules(pkg)
+    isempty(generated_enums) && return kwargs
+    allowed = get(kwargs, :allow_unanalyzable, ())
+    return merge(kwargs, (; allow_unanalyzable = (allowed..., generated_enums...)))
+end
+
 """
     run_explicit_imports(pkg, ExplicitImports; ei_kwargs = (;), ei_broken = ())
 
@@ -841,6 +864,9 @@ so this helper stays usable with any compatible module. `ei_kwargs`
 is a `NamedTuple` keyed by each check's short name (the part after `check_`); its
 value is that check's keyword arguments, so callers curate per-check ignore-lists,
 e.g. `ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:foo,)))`.
+EnumX-generated child modules are automatically excluded from the two source-analysis
+checks: they contain macro-generated enum bindings but no package-authored imports to
+analyze.
 
 `ei_broken` is a collection of those same short-names whose checks are *known-broken*
 (tracked in a GitHub issue). A check whose name is in `ei_broken` runs as
@@ -867,9 +893,9 @@ function run_explicit_imports(pkg::Module, ExplicitImports; ei_kwargs = (;), ei_
             check = getproperty(ExplicitImports, Symbol("check_", name))
             @testset "$(name)" begin
                 if name in ei_broken
-                    @test_broken check(pkg; get(ei_kwargs, name, (;))...) === nothing
+                    @test_broken check(pkg; _explicit_imports_kwargs(pkg, name, ei_kwargs)...) === nothing
                 else
-                    @test check(pkg; get(ei_kwargs, name, (;))...) === nothing
+                    @test check(pkg; _explicit_imports_kwargs(pkg, name, ei_kwargs)...) === nothing
                 end
             end
         end
