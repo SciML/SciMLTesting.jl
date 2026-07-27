@@ -1025,12 +1025,43 @@ function _rendered_doc_names(docs_src::AbstractString)
     return (rendered, autodocs)
 end
 
-# Default docs source dir for a package: <pkgroot>/docs/src, or "" when the package
-# root cannot be located (e.g. `pkg` is `Main`). "" is a non-directory, so the
-# rendered scan finds nothing and the default check fails loudly without a resolvable
-# docs tree.
+function _declares_local_source(project_file, package_name, package_root)
+    project = try
+        TOML.parsefile(project_file)
+    catch
+        return false
+    end
+    source = get(get(project, "sources", Dict{String, Any}()), package_name, nothing)
+    source isa AbstractDict || return false
+    path = get(source, "path", nothing)
+    path isa AbstractString || return false
+    return normpath(abspath(joinpath(dirname(project_file), path))) ==
+           normpath(abspath(package_root))
+end
+
+function _find_docs_src(package_root, package_name)
+    local_docs = joinpath(package_root, "docs", "src")
+    isdir(local_docs) && return local_docs
+
+    root = dirname(package_root)
+    while root != dirname(root)
+        project_file = joinpath(root, "Project.toml")
+        docs_src = joinpath(root, "docs", "src")
+        if isfile(project_file) && isdir(docs_src) &&
+                _declares_local_source(project_file, package_name, package_root)
+            return docs_src
+        end
+        root = dirname(root)
+    end
+    return local_docs
+end
+
+# Default docs source dir for a package. Packages normally use <pkgroot>/docs/src. A
+# monorepo subpackage instead uses its repository manual when the repository Project.toml
+# explicitly declares that package through a local [sources] path. This makes plain
+# run_qa(package) work for both layouts without accepting arbitrary ancestor manuals.
 _default_docs_src(pkg::Module) =
-    (root = pkgdir(pkg); root === nothing ? "" : joinpath(root, "docs", "src"))
+    (root = pkgdir(pkg); root === nothing ? "" : _find_docs_src(root, String(nameof(pkg))))
 
 """
     run_api_docs(pkg::Module; docstrings = true, rendered = true,
@@ -1061,8 +1092,10 @@ Two checks, each its own nested `@testset`:
     ```` ```@autodocs ```` block is present the check passes wholesale — `@autodocs`
     renders whole modules, so anything with a docstring is already rendered.
 
-`docs_src` defaults to `<pkgroot>/docs/src` located via `pkgdir(pkg)`, so a repo whose
-docs live in the standard place needs no path plumbing.
+`docs_src` defaults to `<pkgroot>/docs/src` located via `pkgdir(pkg)`. For a monorepo
+subpackage, it also discovers the repository-level `docs/src` when the root
+`Project.toml` declares the package under `[sources]` with its local path. Both layouts
+therefore use plain `run_qa(MyPackage)` without repo-specific path plumbing.
 
 `ignore` (for the docstring check) and `rendered_ignore` (for the rendered check) are
 collections of names (`Symbol`s) to exclude — use them for names that legitimately
