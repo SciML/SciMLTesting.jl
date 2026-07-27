@@ -504,6 +504,13 @@ end
         end
         @test FakeAqua.LAST_KWARGS[].ambiguities === false   # broken-disable overrode `true`
 
+        # Standard SciML solver extension hooks are accepted centrally, while caller
+        # supplied Aqua hooks remain present.
+        kwargs = SciMLTesting._standard_aqua_kwargs(
+            (; piracies = (; treat_as_own = [identity])), [length, identity]
+        )
+        @test kwargs.piracies.treat_as_own == [identity, length]
+
         # `jet_broken` with a non-empty report registers exactly one Broken (the
         # `@test_broken isempty(...)`), no failures; and `mode` was dropped (FakeJET's
         # report_package asserts it never receives `mode`), while target_modules passes through.

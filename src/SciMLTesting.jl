@@ -778,8 +778,9 @@ function run_qa(
             # broken-disable wins over any aqua_kwargs entry) and emit a tracked
             # placeholder per name. Merge order puts the `name => false` pairs last so
             # they override a same-named aqua_kwargs entry.
-            effective_aqua_kwargs = isempty(aqua_broken) ? aqua_kwargs :
-                merge(NamedTuple(aqua_kwargs), _aqua_broken_disable(aqua_broken))
+            effective_aqua_kwargs = _standard_aqua_kwargs(aqua_kwargs)
+            effective_aqua_kwargs = isempty(aqua_broken) ? effective_aqua_kwargs :
+                merge(effective_aqua_kwargs, _aqua_broken_disable(aqua_broken))
             run_aqua = () -> begin
                 Aqua.test_all(pkg; effective_aqua_kwargs...)
                 for name in aqua_broken
@@ -816,6 +817,32 @@ end
 # Build the `(; name => false, ...)` NamedTuple that disables each named Aqua
 # sub-check when merged over `aqua_kwargs`.
 _aqua_broken_disable(names) = NamedTuple{Tuple(Symbol.(names))}(ntuple(_ -> false, length(names)))
+
+function _solver_extension_functions()
+    functions = Function[]
+    for module_name in (:SciMLBase, :CommonSolve)
+        for mod in values(Base.loaded_modules)
+            nameof(mod) === module_name || continue
+            for name in (:__init, :__solve, :init, :solve, :solve!)
+                isdefined(mod, name) || continue
+                candidate = getfield(mod, name)
+                candidate isa Function && push!(functions, candidate)
+            end
+        end
+    end
+    return unique(functions)
+end
+
+function _standard_aqua_kwargs(aqua_kwargs, extension_functions = _solver_extension_functions())
+    kwargs = NamedTuple(aqua_kwargs)
+    isempty(extension_functions) && return kwargs
+    piracies = NamedTuple(get(kwargs, :piracies, (;)))
+    treat_as_own = Function[]
+    existing = get(piracies, :treat_as_own, ())
+    existing === nothing || append!(treat_as_own, existing)
+    append!(treat_as_own, extension_functions)
+    return merge(kwargs, (; piracies = merge(piracies, (; treat_as_own = unique(treat_as_own)))))
+end
 
 # `JET.report_package` is report-only and takes JET config keys via `jetconfigs...`
 # (target_modules / target_defined_modules / ignored_modules / ...). It does NOT have
