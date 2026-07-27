@@ -999,18 +999,18 @@ end
         mkpath(package_root)
         repository_docs = joinpath(repository, "docs", "src")
         mkpath(repository_docs)
-        write(
-            joinpath(repository, "Project.toml"),
-            "[sources]\nApiFixture = {path = \"lib/ApiFixture\"}\n",
-        )
+        write(joinpath(repository, "Project.toml"), "name = \"FixtureRepository\"\n")
         @test SciMLTesting._find_docs_src(package_root, "ApiFixture") == repository_docs
 
-        write(
-            joinpath(repository, "Project.toml"),
-            "[sources]\nOtherPackage = {path = \"lib/ApiFixture\"}\n",
-        )
-        @test SciMLTesting._find_docs_src(package_root, "ApiFixture") ==
-            joinpath(package_root, "docs", "src")
+        unrelated_root = joinpath(repository, "packages", "ApiFixture")
+        mkpath(unrelated_root)
+        @test SciMLTesting._find_docs_src(unrelated_root, "ApiFixture") ==
+            joinpath(unrelated_root, "docs", "src")
+
+        mismatched_root = joinpath(repository, "lib", "OtherPackage")
+        mkpath(mismatched_root)
+        @test SciMLTesting._find_docs_src(mismatched_root, "ApiFixture") ==
+            joinpath(mismatched_root, "docs", "src")
 
         package_docs = joinpath(package_root, "docs", "src")
         mkpath(package_docs)
