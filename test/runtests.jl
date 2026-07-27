@@ -1010,7 +1010,7 @@ end
             "[sources]\nOtherPackage = {path = \"lib/ApiFixture\"}\n",
         )
         @test SciMLTesting._find_docs_src(package_root, "ApiFixture") ==
-              joinpath(package_root, "docs", "src")
+            joinpath(package_root, "docs", "src")
 
         package_docs = joinpath(package_root, "docs", "src")
         mkpath(package_docs)

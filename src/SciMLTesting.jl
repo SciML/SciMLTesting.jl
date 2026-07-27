@@ -1036,7 +1036,7 @@ function _declares_local_source(project_file, package_name, package_root)
     path = get(source, "path", nothing)
     path isa AbstractString || return false
     return normpath(abspath(joinpath(dirname(project_file), path))) ==
-           normpath(abspath(package_root))
+        normpath(abspath(package_root))
 end
 
 function _find_docs_src(package_root, package_name)
