@@ -48,10 +48,8 @@ using Test: Test, @testset, @test, @test_broken
 using SafeTestsets: SafeTestsets, @safetestset
 using Aqua: Aqua
 using ExplicitImports: ExplicitImports
-# REPL is imported purely for its load-time side effect: on Julia >= 1.11 the methods
-# of `Base.Docs.doc(::Base.Docs.Binding)` (the docstring lookup `run_api_docs` uses)
-# live in the REPL stdlib and are absent until it is loaded. Importing it here makes
-# the docstring check work in a bare `Pkg.test` process that never starts a REPL.
+# REPL provides the public `@doc` lookup used on Julia 1.10, before `Docs.hasdoc`
+# became available.
 import REPL
 
 export current_group, activate_group_env, run_qa, run_explicit_imports, detect_sublibrary_group,
@@ -988,7 +986,7 @@ function public_reexports(pkg::Module; allow = ())
         binding_owner = try
             which(pkg, name)
         catch
-            pkg
+            return true
         end
         !_is_within_module(binding_owner, pkg) && return true
         value_owner = try
@@ -1010,16 +1008,27 @@ function _is_within_module(candidate::Module, root::Module)
     return true
 end
 
-# Whether `pkg.name` resolves to a docstring. Uses `Base.Docs.doc` on the *binding*
-# (not the object), so a re-exported name that is documented in the module that
-# actually defines it counts as documented here too (the binding follows the import
-# alias to that module's docs). `import REPL` at load time ensures the binding-lookup
-# methods exist on Julia >= 1.11. A name with no binding in `pkg` (should not happen
-# for a `names`-reported symbol) counts as undocumented.
-function _has_docstring(pkg::Module, name::Symbol)
-    isdefined(pkg, name) || return false
-    doc = sprint(show, MIME"text/plain"(), Base.Docs.doc(Base.Docs.Binding(pkg, name)))
-    return !occursin("No documentation found", doc)
+# Whether `pkg.name` resolves to a docstring. Binding lookup follows imported names
+# to their defining modules. A binding with no unique owner is not documentable.
+@static if VERSION >= v"1.11"
+    function _has_docstring(pkg::Module, name::Symbol)
+        isdefined(pkg, name) || return false
+        return try
+            Base.Docs.hasdoc(pkg, name)
+        catch
+            false
+        end
+    end
+else
+    function _has_docstring(pkg::Module, name::Symbol)
+        isdefined(pkg, name) || return false
+        ref = Expr(:., pkg, QuoteNode(name))
+        call = Expr(
+            :macrocall, GlobalRef(Base.Docs, Symbol("@doc")), LineNumberNode(0), ref
+        )
+        doc = eval(call)
+        return !occursin("No documentation found", sprint(show, MIME"text/plain"(), doc))
+    end
 end
 
 # Only names owned by this package's module hierarchy require a local rendered API

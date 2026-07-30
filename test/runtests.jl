@@ -114,6 +114,23 @@ module FunctionReexportFixture
     export run_qa
 end
 
+module ConstantOwnerA
+    export shared_constant
+    "shared constant from owner A"
+    const shared_constant = 1
+end
+
+module ConstantOwnerB
+    export shared_constant
+    "shared constant from owner B"
+    const shared_constant = 1
+end
+
+module AmbiguousConstantReexportFixture
+    using ..ConstantOwnerA, ..ConstantOwnerB
+    export shared_constant
+end
+
 module ReexportOwnerFixture
     export owned_function, OwnedType, OwnedModule, owned_scalar, @owned_macro
     owned_function() = nothing
@@ -978,6 +995,7 @@ end
     @testset "public_reexports" begin
         @test public_reexports(ModuleReexportFixture) == [:SciMLTesting]
         @test public_reexports(FunctionReexportFixture) == [:run_qa]
+        @test public_reexports(AmbiguousConstantReexportFixture) == [:shared_constant]
         @test public_reexports(ComprehensiveReexportFixture) ==
             [:OwnedModule, :OwnedType, :owned_function, :owned_scalar]
         @test public_reexports(AliasReexportFixture) ==
@@ -1101,6 +1119,19 @@ end
         end
         @test c[:fail] == 1
         @test c[:broken] == 0
+
+        binding_is_ambiguous = try
+            which(AmbiguousConstantReexportFixture, :shared_constant)
+            false
+        catch
+            true
+        end
+        c = counts_of() do
+            run_api_docs(AmbiguousConstantReexportFixture; rendered = false)
+        end
+        @test c[:error] == 0
+        @test c[:fail] == binding_is_ambiguous
+        @test c[:pass] == !binding_is_ambiguous
 
         # Ignoring the undocumented names makes it pass. (:undocumented_public is not in
         # the API on 1.10, so ignoring it there is a harmless no-op.)
