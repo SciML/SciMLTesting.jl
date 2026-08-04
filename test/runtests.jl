@@ -479,13 +479,17 @@ end
         mktempdir() do qa_environment
             try
                 Pkg.activate(qa_environment; io = devnull)
+                qa_project = joinpath(qa_environment, "Project.toml")
                 empty!(LOAD_PATH)
                 append!(LOAD_PATH, (qa_environment, "@stdlib"))
+                @test Base.active_project() == qa_project
                 @test !child_can_load_aqua()
 
                 SciMLTesting._with_aqua_dependency_load_path() do
+                    @test Base.active_project() == qa_project
                     @test child_can_load_aqua()
                 end
+                @test Base.active_project() == qa_project
             finally
                 original_project === nothing ? Pkg.activate(; io = devnull) :
                     Pkg.activate(original_project; io = devnull)
