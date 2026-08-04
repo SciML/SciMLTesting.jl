@@ -464,6 +464,31 @@ end
         )
     end
 
+    @testset "Aqua ambiguity subprocess resolves SciMLTesting dependencies" begin
+        original_load_path = copy(LOAD_PATH)
+        qa_project = joinpath(mktempdir(), "Project.toml")
+        write(qa_project, "[deps]\n")
+        child_can_load_aqua() = success(
+            pipeline(
+                `$(Base.julia_cmd()) --startup-file=no -e $("$(Base.load_path_setup_code())\nusing Aqua")`;
+                stdout = devnull, stderr = devnull,
+            ),
+        )
+
+        try
+            empty!(LOAD_PATH)
+            append!(LOAD_PATH, (qa_project, "@stdlib"))
+            @test !child_can_load_aqua()
+
+            SciMLTesting._with_aqua_dependency_load_path() do
+                @test child_can_load_aqua()
+            end
+        finally
+            empty!(LOAD_PATH)
+            append!(LOAD_PATH, original_load_path)
+        end
+    end
+
     @testset "run_qa broken markers" begin
         # Count every test result of a kind recursively in a testset's results tree
         # (a testset's children are themselves testsets). Used to assert that the
@@ -676,6 +701,29 @@ end
         @test c[:error] == 0
         # No broken-disable keys leaked into the Aqua call.
         @test !haskey(FakeAqua.LAST_KWARGS[], :ambiguities)
+        @test FakeAqua.LAST_KWARGS[].persistent_tasks.tmax == 60
+
+        FakeAqua.LAST_KWARGS[] = nothing
+        counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = FakeAqua, JET = nothing, ExplicitImports = nothing,
+                explicit_imports = false, api_docs = false, clean_sources = false,
+                aqua_kwargs = (; persistent_tasks = (; exclude = (:fixture,))),
+            )
+        end
+        persistent_tasks = FakeAqua.LAST_KWARGS[].persistent_tasks
+        @test persistent_tasks.tmax == 60
+        @test persistent_tasks.exclude == (:fixture,)
+
+        FakeAqua.LAST_KWARGS[] = nothing
+        counts_of() do
+            run_qa(
+                SciMLTesting; Aqua = FakeAqua, JET = nothing, ExplicitImports = nothing,
+                explicit_imports = false, api_docs = false, clean_sources = false,
+                aqua_kwargs = (; persistent_tasks = false),
+            )
+        end
+        @test FakeAqua.LAST_KWARGS[].persistent_tasks === false
     end
 
     @testset "public-API EI checks gated to Julia >= 1.11" begin
@@ -1073,6 +1121,19 @@ end
         package_docs = joinpath(package_root, "docs", "src")
         mkpath(package_docs)
         @test SciMLTesting._find_docs_src(package_root, "ApiFixture") == package_docs
+
+        rm(joinpath(package_root, "docs"); recursive = true)
+        write(
+            joinpath(repository, "docs", "Project.toml"),
+            "[deps]\nOtherPackage = \"00000000-0000-0000-0000-000000000000\"\n",
+        )
+        sibling_docs = joinpath(repository, "lib", "Facade", "docs", "src")
+        mkpath(sibling_docs)
+        write(
+            joinpath(dirname(sibling_docs), "Project.toml"),
+            "[deps]\nApiFixture = \"00000000-0000-0000-0000-000000000001\"\n",
+        )
+        @test SciMLTesting._find_docs_src(package_root, "ApiFixture") == sibling_docs
     end
 
     @testset "run_api_docs docstrings check" begin
@@ -1112,6 +1173,13 @@ end
         end
         @test c[:fail] == 0 && c[:error] == 0
         @test c[:pass] >= 1
+
+        # An explicitly imported public binding is documented by its owner; a
+        # facade should not need to duplicate that definition-site docstring.
+        c = counts_of() do
+            run_api_docs(FunctionReexportFixture; rendered = false)
+        end
+        @test c[:fail] == 0 && c[:error] == 0
 
         # The fixture has undocumented public API -> one Fail (the docstrings @test).
         c = counts_of() do
