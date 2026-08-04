@@ -72,7 +72,9 @@ module FakeExplicitImports
     function check_all_qualified_accesses_are_public(pkg; ignore = (), kwargs...)
         PUBLIC_CALLED[] = true
         @test pkg === SciMLTesting
-        @test ignore == (:internal_thing,)
+        @test ignore == (
+            :internal_thing, :Broadcasted, :broadcastable, :dotview, :materialize!,
+        )
         return _result(:check_all_qualified_accesses_are_public)
     end
 end
@@ -746,7 +748,7 @@ end
         @test kwargs.allow_unanalyzable == (ApiFixture, EnumFixture.Generated)
         @test SciMLTesting._explicit_imports_kwargs(
             EnumFixture, :all_qualified_accesses_are_public, (;)
-        ) == NamedTuple()
+        ) == (; ignore = SciMLTesting.BASE_BROADCAST_EXTENSION_HOOKS)
     end
 
     @testset "run_qa enable-flag defaulting" begin

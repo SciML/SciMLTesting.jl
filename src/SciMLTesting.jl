@@ -915,8 +915,22 @@ function _generated_enum_modules(pkg::Module)
     return Tuple(modules)
 end
 
+const BASE_BROADCAST_EXTENSION_HOOKS = (
+    :Broadcasted, :broadcastable, :dotview, :materialize!,
+)
+
 function _explicit_imports_kwargs(pkg::Module, name::Symbol, ei_kwargs)
     kwargs = NamedTuple(get(ei_kwargs, name, (;)))
+    if name === :all_qualified_accesses_are_public
+        # Julia's broadcast-extension protocol has no public spelling: packages must
+        # dispatch on these Base hooks to support dotted assignment and broadcasting.
+        # Keep that language-level exception here, rather than requiring every package
+        # to carry the same per-repository ExplicitImports ignore list.
+        kwargs = merge(
+            kwargs,
+            (; ignore = (get(kwargs, :ignore, ())..., BASE_BROADCAST_EXTENSION_HOOKS...)),
+        )
+    end
     name in (:no_implicit_imports, :no_stale_explicit_imports) || return kwargs
     generated_enums = _generated_enum_modules(pkg)
     isempty(generated_enums) && return kwargs
@@ -939,6 +953,10 @@ so this helper stays usable with any compatible module. `ei_kwargs`
 is a `NamedTuple` keyed by each check's short name (the part after `check_`); its
 value is that check's keyword arguments, so callers curate per-check ignore-lists,
 e.g. `ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:foo,)))`.
+SciMLTesting itself ignores Base's `Broadcasted`, `broadcastable`, `dotview`, and
+`materialize!` for the public-access check: they are required Julia broadcast
+extension hooks but Base does not declare them public. This global exception does not
+cover dependency-owned names.
 EnumX-generated child modules are automatically excluded from the two source-analysis
 checks: they contain macro-generated enum bindings but no package-authored imports to
 analyze.
