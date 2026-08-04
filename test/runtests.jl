@@ -468,8 +468,7 @@ end
 
     @testset "Aqua ambiguity subprocess resolves SciMLTesting dependencies" begin
         original_load_path = copy(LOAD_PATH)
-        qa_project = joinpath(mktempdir(), "Project.toml")
-        write(qa_project, "[deps]\n")
+        original_project = Base.active_project()
         child_can_load_aqua() = success(
             pipeline(
                 `$(Base.julia_cmd()) --startup-file=no -e $("$(Base.load_path_setup_code())\nusing Aqua")`;
@@ -477,17 +476,22 @@ end
             ),
         )
 
-        try
-            empty!(LOAD_PATH)
-            append!(LOAD_PATH, (qa_project, "@stdlib"))
-            @test !child_can_load_aqua()
+        mktempdir() do qa_environment
+            try
+                Pkg.activate(qa_environment; io = devnull)
+                empty!(LOAD_PATH)
+                append!(LOAD_PATH, (qa_environment, "@stdlib"))
+                @test !child_can_load_aqua()
 
-            SciMLTesting._with_aqua_dependency_load_path() do
-                @test child_can_load_aqua()
+                SciMLTesting._with_aqua_dependency_load_path() do
+                    @test child_can_load_aqua()
+                end
+            finally
+                original_project === nothing ? Pkg.activate(; io = devnull) :
+                    Pkg.activate(original_project; io = devnull)
+                empty!(LOAD_PATH)
+                append!(LOAD_PATH, original_load_path)
             end
-        finally
-            empty!(LOAD_PATH)
-            append!(LOAD_PATH, original_load_path)
         end
     end
 

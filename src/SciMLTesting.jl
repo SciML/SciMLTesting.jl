@@ -531,25 +531,41 @@ function with_clean_persistent_tasks_sources(f; verbose::Bool = false)
     end
 end
 
-# Aqua runs its ambiguity detector in a clean Julia process. That child receives the
-# caller's QA environment, where Aqua is intentionally not a direct dependency, so
-# also expose SciMLTesting's project while Aqua builds its child command.
+# Aqua runs its ambiguity detector in a clean Julia process. Preserve a caller's QA
+# environment when it declares Aqua directly; otherwise give the child an isolated
+# environment whose manifest resolves SciMLTesting's installed Aqua dependency.
 function _with_aqua_dependency_load_path(f)
-    package_root = pkgdir(@__MODULE__)
-    package_root === nothing && return f()
-    project_file = joinpath(package_root, "Project.toml")
-    isfile(project_file) || return f()
+    _active_project_declares_dependency(:Aqua) && return f()
 
+    aqua_root = pkgdir(Aqua)
+    aqua_root === nothing && return f()
     original_load_path = copy(LOAD_PATH)
-    if !(project_file in LOAD_PATH)
-        pushfirst!(LOAD_PATH, project_file)
+    original_project = Base.active_project()
+    return mktempdir() do environment
+        try
+            Pkg.activate(environment; io = devnull)
+            Pkg.develop(path = aqua_root; io = devnull)
+        finally
+            original_project === nothing ? Pkg.activate(; io = devnull) :
+                Pkg.activate(original_project; io = devnull)
+        end
+
+        pushfirst!(LOAD_PATH, environment)
+        try
+            return f()
+        finally
+            empty!(LOAD_PATH)
+            append!(LOAD_PATH, original_load_path)
+        end
     end
-    try
-        return f()
-    finally
-        empty!(LOAD_PATH)
-        append!(LOAD_PATH, original_load_path)
-    end
+end
+
+function _active_project_declares_dependency(name::Symbol)
+    project_file = Base.active_project()
+    (project_file === nothing || !isfile(project_file)) && return false
+    project = TOML.parsefile(project_file)
+    deps = get(project, "deps", nothing)
+    return deps isa AbstractDict && haskey(deps, string(name))
 end
 
 # For every dep of the active environment whose installed Project.toml declares a
