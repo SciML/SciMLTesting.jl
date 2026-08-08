@@ -1031,6 +1031,23 @@ else
     end
 end
 
+# A module name that is public only because the module itself was reexported. Julia
+# exports a module's own name, so `using Dep` inside a facade puts `:Dep` into the
+# facade's public API; the docstring obligation for it belongs to the package that
+# defines the module, not to every reexporter. Deliberately restricted to `Module`
+# values: a reexported function, type or constant still owes a docstring, since that
+# one resolves through the binding to the defining package's docs.
+function _is_external_module_reexport(pkg::Module, name::Symbol)
+    isdefined(pkg, name) || return false
+    value = try
+        getfield(pkg, name)
+    catch
+        return false
+    end
+    value isa Module || return false
+    return !_is_within_module(value, pkg)
+end
+
 # Only names owned by this package's module hierarchy require a local rendered API
 # entry. External public reexports are audited separately by `public_reexports`.
 function _requires_local_rendering(pkg::Module, name::Symbol)
@@ -1141,7 +1158,10 @@ Two checks, each its own nested `@testset`:
   * **docstrings** (`docstrings = true`, on by default): every public API name has a
     docstring. A re-exported name documented in its defining package counts as
     documented (the check follows the binding, not a local docstring), so a repo is
-    not forced to redocument names it re-exports from a dependency.
+    not forced to redocument names it re-exports from a dependency. A re-exported
+    *module* name — public only because `using Dep` exports `Dep` itself — is exempt
+    entirely, mirroring the rendered check; the obligation to document `Dep` belongs
+    to `Dep`. Re-exported functions, types and constants are not exempt.
   * **rendered** (`rendered = true`, on by default): every public API name appears inside a
     ```` ```@docs ```` block somewhere under `docs_src`, so it is rendered in the
     manual. Re-exported modules inherit the defining package's rendered module
@@ -1199,7 +1219,13 @@ function run_api_docs(
     @testset "$testset" begin
         if docstrings
             skip = Set{Symbol}(Symbol.(ignore))
-            undocumented = sort!(filter(n -> !(n in skip) && !_has_docstring(pkg, n), api))
+            undocumented = sort!(
+                filter(
+                    n -> !(n in skip) && !_is_external_module_reexport(pkg, n) &&
+                        !_has_docstring(pkg, n),
+                    api,
+                )
+            )
             @testset "public API has docstrings" begin
                 docstrings_broken ? (@test_broken isempty(undocumented)) :
                     (@test isempty(undocumented))

@@ -201,6 +201,15 @@ module LocalModuleFixture
     export LocalSubmodule
 end
 
+# Reexports an undocumented external module and an undocumented external function
+# next to an undocumented local name, so the docstrings check can be shown to exempt
+# the module and only the module.
+module UndocumentedModuleReexportFixture
+    import ..ReexportOwnerFixture: OwnedModule, owned_function
+    export OwnedModule, owned_function, local_undocumented
+    local_undocumented() = nothing
+end
+
 # A minimal AbstractTestSet that just collects every recorded result (including
 # nested testsets) and NEVER throws on finish. Wrapping a run_qa call in one lets a
 # test inspect the Broken/Pass/Fail/Error counts a broken-marker produced without
@@ -1144,6 +1153,43 @@ end
         end
         @test c[:fail] == 0 && c[:error] == 0
         @test c[:pass] == 1
+
+        # A reexported external module is public only because Julia exports a module's
+        # own name; documenting it belongs to the package that defines it.
+        c = counts_of() do
+            run_api_docs(
+                UndocumentedModuleReexportFixture;
+                rendered = false,
+                ignore = (:owned_function, :local_undocumented),
+            )
+        end
+        @test c[:fail] == 0 && c[:error] == 0
+
+        # The exemption covers modules only: a reexported function is still reported.
+        c = counts_of() do
+            run_api_docs(
+                UndocumentedModuleReexportFixture;
+                rendered = false,
+                ignore = (:local_undocumented,),
+            )
+        end
+        @test c[:fail] == 1
+
+        @test SciMLTesting._is_external_module_reexport(
+            UndocumentedModuleReexportFixture, :OwnedModule
+        )
+        @test !SciMLTesting._is_external_module_reexport(
+            UndocumentedModuleReexportFixture, :owned_function
+        )
+        @test !SciMLTesting._is_external_module_reexport(
+            LocalModuleFixture, :LocalSubmodule
+        )
+
+        # A package's own undocumented submodule is still the package's to document.
+        c = counts_of() do
+            run_api_docs(LocalModuleFixture; rendered = false)
+        end
+        @test c[:fail] == 1
 
         # docstrings_broken records Broken while names remain undocumented (migration).
         c = counts_of() do
