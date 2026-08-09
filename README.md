@@ -48,7 +48,7 @@ test = ["Test", "SciMLTesting", ...]
 | `run_everything(; env = "GROUP", kwargs...)` | Convenience: set `ENV[env] = "Everything"` and call `run_tests`. Prefer for agents / long local full-suite runs. See [Running every test](#running-every-test-groupeverything). |
 | `read_test_groups(test_dir)` | Read `test_dir/test_groups.toml` (the group list + per-group config such as `in_all`) used by folder-discovery mode. |
 | `current_group(; env = "GROUP", default = "All")` | Read the test-group env var, defaulting to `"All"` (empty string also normalizes to the default). |
-| `activate_group_env(group_dir; parent, develop, instantiate, develop_sources)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. |
+| `activate_group_env(group_dir; parent, develop, instantiate, develop_sources, sandbox)` | `Pkg.activate` a per-group `Project.toml`, `develop` the parent package(s) by path, backport `[sources]`, `instantiate`. Acts on a scratch copy of the env, so the repo's tracked `Project.toml` is never rewritten (`sandbox = false` opts out). |
 | `develop_sources!(group_dir; parent)` | On Julia < 1.11, `Pkg.develop` the env's `[sources]` path graph (recursively); a no-op on 1.11+. |
 | `run_qa(pkg; Aqua, JET, ExplicitImports, aqua, jet, explicit_imports, api_docs, check_reexports, aqua_broken, jet_broken, ei_broken, ...)` | Run the standard Aqua/JET/ExplicitImports QA body, public-API documentation check, and public-reexport audit. Aqua, ExplicitImports, API docs, and `check_reexports` run by default; `using JET` registers JET and turns its check on. Intentional facade bindings must be listed in `reexports_allow`. The `*_broken` kwargs mark known-broken findings as `@test_broken`. |
 | `run_api_docs(pkg; docstrings = true, rendered = true, docs_src, ignore, rendered_ignore, docstrings_broken, rendered_broken)` | Assert every exported/`public` name of `pkg` has a docstring and every locally rendered name appears in a `@docs` block under `docs/src`. Re-exported dependency modules inherit their defining package's rendering. |
@@ -436,6 +436,15 @@ activate_group_env(
     parent = [joinpath(@__DIR__, ".."), joinpath(@__DIR__, "..", "..", "..")],
 )
 ```
+
+`Pkg.develop`/`Pkg.instantiate` rewrite the environment they act on, and a group
+env is a git-tracked directory of the repo under test. `activate_group_env`
+therefore activates a scratch **copy** of `group_dir` (its `Project.toml`,
+`Manifest.toml` and `LocalPreferences.toml`, with relative `path` entries
+rewritten to absolute paths), leaving the working tree untouched. Test code
+should locate files with `@__DIR__` rather than relative to
+`Base.active_project()`, which now points into a temporary directory. Pass
+`sandbox = false` to activate the env in place instead.
 
 ## Running every test (`GROUP=Everything`)
 

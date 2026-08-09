@@ -353,7 +353,8 @@ end
 
 """
     activate_group_env(group_dir; parent = dirname(dirname(abspath(group_dir))),
-                        develop = true, instantiate = true, develop_sources = true)
+                        develop = true, instantiate = true, develop_sources = true,
+                        sandbox = true)
 
 Activate the per-group test environment at `group_dir` and prepare it for testing
 the in-repo package.
@@ -361,7 +362,8 @@ the in-repo package.
 `group_dir` is the directory holding the group's own `Project.toml` (for example
 `joinpath(@__DIR__, "qa")` or `joinpath(@__DIR__, "downstream")`). The steps are:
 
-  1. `Pkg.activate(group_dir)`,
+  1. `Pkg.activate` the env (a scratch copy of `group_dir` unless `sandbox` is
+     `false`, see below),
   2. when `develop` is `true`, `Pkg.develop` each path in `parent` so the
      activated environment uses the local (PR-branch) source of the package under
      test instead of a registered release,
@@ -374,6 +376,29 @@ the in-repo package.
 typically develops both the sublibrary and the monorepo root). It defaults to the
 repository root inferred from `group_dir` as `test/<Group>` ⇒ repo root, i.e.
 `dirname(dirname(group_dir))`.
+
+## The sandbox copy
+
+`Pkg.develop` and `Pkg.instantiate` write to the environment they act on, and
+`group_dir` is a git-tracked directory of the repo under test: activating it
+directly leaves the working tree dirty on every run (`Pkg.develop` adds each
+`parent` to `[deps]`, and Pkg normalizes the rest of the TOML while writing).
+Worse, a developed `parent` is recorded in `[deps]` with no matching `[sources]`
+entry — committing that churn makes the group env depend on the *registered*
+release of the package the repo is testing.
+
+So with `sandbox = true` (the default) the env's `Project.toml`, `Manifest.toml`
+and `LocalPreferences.toml` are copied into a temporary directory and that copy
+is activated; nothing under `group_dir` is written. Relative `path` entries (the
+`[sources]` table, developed manifest entries) are rewritten to absolute paths in
+the copy, since it no longer sits at the env's original depth in the repo. The
+copy is per `group_dir` and per process: re-activating the same group env reuses
+it, and it is removed when the process exits.
+
+Because the activated project is the copy, `dirname(Base.active_project())` is a
+temporary directory rather than `group_dir`. Test code should locate files with
+`@__DIR__`, not relative to the active project. Pass `sandbox = false` for the
+old in-place behavior.
 
 This replaces the `activate_qa_env` / `activate_downstream_env` /
 `activate_examples_env` helpers copied into every SciML `runtests.jl`, which all
@@ -398,8 +423,9 @@ function activate_group_env(
         develop::Bool = true,
         instantiate::Bool = true,
         develop_sources::Bool = true,
+        sandbox::Bool = true,
     )
-    Pkg.activate(group_dir)
+    Pkg.activate(sandbox ? _sandbox_group_env(group_dir) : abspath(group_dir))
     parents = parent isa AbstractString ? (parent,) : parent
     # On Julia < 1.11 `[sources]` is ignored, so develop the parent(s) (the
     # package(s) under test) AND the env's `[sources]` path graph in a *single*
@@ -425,6 +451,63 @@ function activate_group_env(
     end
     instantiate && Pkg.instantiate()
     return nothing
+end
+
+const SANDBOX_PROJECT_FILES = ("Project.toml", "JuliaProject.toml", "Manifest.toml", "JuliaManifest.toml")
+const SANDBOX_VERBATIM_FILES = ("LocalPreferences.toml", "JuliaLocalPreferences.toml")
+
+# One scratch env per group dir per process, so re-activating a group env within a
+# run reuses its (already resolved) copy instead of resolving from scratch.
+const SANDBOX_ENVS = Dict{String, String}()
+
+# Copy a group env into a scratch directory, so that the `Pkg.develop`/`Pkg.instantiate`
+# done by `activate_group_env` never writes to the git-tracked env in the repo under test.
+function _sandbox_group_env(group_dir::AbstractString)
+    src = abspath(group_dir)
+    dest = get!(() -> mktempdir(; prefix = "jl_sciml_group_env_", cleanup = true), SANDBOX_ENVS, src)
+    for name in SANDBOX_PROJECT_FILES
+        _sync_env_file(src, dest, name; rewrite_paths = true)
+    end
+    for name in SANDBOX_VERBATIM_FILES
+        _sync_env_file(src, dest, name; rewrite_paths = false)
+    end
+    return dest
+end
+
+# `rewrite_paths` resolves every relative `path` value (a `[sources]` table, a manifest's
+# developed entries) against the group env: the copy does not sit at the env's original
+# depth in the repo, so "../../../Sibling" would otherwise resolve outside the repo.
+function _sync_env_file(src::AbstractString, dest::AbstractString, name::AbstractString; rewrite_paths::Bool)
+    file = joinpath(src, name)
+    target = joinpath(dest, name)
+    if !isfile(file)
+        isfile(target) && rm(target)
+    elseif rewrite_paths
+        parsed = _absolutize_paths!(TOML.parsefile(file), src)
+        open(target, "w") do io
+            TOML.print(io, parsed; sorted = true)
+        end
+    else
+        cp(file, target; force = true)
+    end
+    return nothing
+end
+
+function _absolutize_paths!(value, base::AbstractString)
+    if value isa AbstractDict
+        path = get(value, "path", nothing)
+        if path isa AbstractString && !isabspath(path)
+            value["path"] = abspath(joinpath(base, path))
+        end
+        for v in values(value)
+            _absolutize_paths!(v, base)
+        end
+    elseif value isa AbstractVector
+        for v in value
+            _absolutize_paths!(v, base)
+        end
+    end
+    return value
 end
 
 # Build `Pkg.develop` specs for a list of project directories, dropping duplicate

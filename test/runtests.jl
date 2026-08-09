@@ -299,18 +299,24 @@ end
 
         try
             activate_group_env(group_dir)
-            # The activated project is the group's Project.toml ...
-            @test Base.active_project() == joinpath(group_dir, "Project.toml")
-            # ... and the repo-root package was developed into it by path.
+            # The activated project is a sandbox copy of the group's Project.toml ...
+            @test basename(Base.active_project()) == "Project.toml"
+            @test !samefile(dirname(Base.active_project()), group_dir)
+            # ... the repo-root package was developed into it by path ...
             deps = Pkg.TOML.parsefile(Base.active_project())
             @test haskey(deps, "deps") && haskey(deps["deps"], "TinyPkg")
+            # ... and the env in the repo was left untouched.
+            @test read(joinpath(group_dir, "Project.toml"), String) == ""
+
+            # `sandbox = false` activates the env in the repo itself.
+            activate_group_env(group_dir; sandbox = false, develop = false, instantiate = false)
+            @test Base.active_project() == joinpath(group_dir, "Project.toml")
 
             # `develop = false` / `instantiate = false` just activates.
             other = joinpath(repo, "test", "core")
             mkpath(other)
             write(joinpath(other, "Project.toml"), "")
             activate_group_env(other; develop = false, instantiate = false)
-            @test Base.active_project() == joinpath(other, "Project.toml")
             parsed = Pkg.TOML.parsefile(Base.active_project())
             @test !haskey(get(parsed, "deps", Dict()), "TinyPkg")
         finally
@@ -360,13 +366,75 @@ end
             # "multiple packages with the same UUID" (RootPkg is both a parent and a
             # [sources] entry).
             activate_group_env(group_dir)
-            @test Base.active_project() == joinpath(group_dir, "Project.toml")
+            @test basename(Base.active_project()) == "Project.toml"
             if VERSION < v"1.11"
-                manifest = Pkg.TOML.parsefile(joinpath(group_dir, "Manifest.toml"))
+                manifest = Pkg.TOML.parsefile(joinpath(dirname(Base.active_project()), "Manifest.toml"))
                 entries = get(manifest, "deps", manifest)
                 @test get(entries["Sib"][1], "path", nothing) == abspath(sib)
                 @test get(entries["RootPkg"][1], "path", nothing) == abspath(repo)
             end
+        finally
+            Pkg.activate(original_project)
+        end
+    end
+
+    @testset "activate_group_env leaves the group env's Project.toml untouched" begin
+        # Regression (SciML/SciMLTesting.jl#46): the group env is a git-tracked
+        # directory of the repo under test, and `Pkg.develop` rewrites the project
+        # it is called on. A monorepo sublibrary QA group develops BOTH the
+        # sublibrary and the monorepo root, and the root is not among the env's
+        # [deps], so every QA run added it (plus Pkg's TOML normalization) to a
+        # tracked file. The activated env must be a copy.
+        original_project = Base.active_project()
+        repo = mktempdir()
+        sib = joinpath(repo, "lib", "Sib"); mkpath(joinpath(sib, "src"))
+        write(
+            joinpath(sib, "Project.toml"),
+            "name = \"Sib\"\nuuid = \"00000000-0000-0000-0000-0000000000d1\"\nversion = \"0.1.0\"\n"
+        )
+        write(joinpath(sib, "src", "Sib.jl"), "module Sib\nend\n")
+        sub = joinpath(repo, "lib", "Sub"); mkpath(joinpath(sub, "src"))
+        write(
+            joinpath(sub, "Project.toml"),
+            "name = \"Sub\"\nuuid = \"00000000-0000-0000-0000-0000000000d2\"\nversion = \"0.1.0\"\n\n" *
+                "[deps]\nSib = \"00000000-0000-0000-0000-0000000000d1\"\n\n" *
+                "[sources]\nSib = { path = \"../Sib\" }\n"
+        )
+        write(joinpath(sub, "src", "Sub.jl"), "module Sub\nusing Sib\nend\n")
+        write(
+            joinpath(repo, "Project.toml"),
+            "name = \"RootPkg\"\nuuid = \"00000000-0000-0000-0000-0000000000d3\"\nversion = \"0.1.0\"\n\n" *
+                "[deps]\nSub = \"00000000-0000-0000-0000-0000000000d2\"\n\n" *
+                "[sources]\nSub = { path = \"lib/Sub\" }\n"
+        )
+        mkdir(joinpath(repo, "src"))
+        write(joinpath(repo, "src", "RootPkg.jl"), "module RootPkg\nusing Sub\nend\n")
+        # Sublibrary QA env: the relative [sources] path escapes the env's directory,
+        # so a copy elsewhere on disk only resolves it if the path is rewritten.
+        group_dir = joinpath(sub, "test", "qa"); mkpath(group_dir)
+        project_file = joinpath(group_dir, "Project.toml")
+        write(
+            project_file,
+            "[deps]\nSub = \"00000000-0000-0000-0000-0000000000d2\"\n" *
+                "Sib = \"00000000-0000-0000-0000-0000000000d1\"\n\n" *
+                "[sources.Sib]\npath = \"../../../Sib\"\n"
+        )
+        before = read(project_file, String)
+
+        try
+            # The real monorepo call: develop the sublibrary AND the repo root.
+            activate_group_env(group_dir; parent = [sub, repo])
+            @test read(project_file, String) == before
+            @test !isfile(joinpath(group_dir, "Manifest.toml"))
+            # The sandbox is a working env: both parents developed, and the env's
+            # relative [sources] sibling still resolved to the in-repo package.
+            active = Pkg.TOML.parsefile(Base.active_project())
+            @test haskey(get(active, "deps", Dict()), "RootPkg")
+            @test active["sources"]["Sib"]["path"] == abspath(sib)
+            manifest = Pkg.TOML.parsefile(joinpath(dirname(Base.active_project()), "Manifest.toml"))
+            entries = get(manifest, "deps", manifest)
+            @test abspath(dirname(Base.active_project()), entries["Sib"][1]["path"]) == abspath(sib)
+            @test abspath(dirname(Base.active_project()), entries["Sub"][1]["path"]) == abspath(sub)
         finally
             Pkg.activate(original_project)
         end
@@ -2066,17 +2134,15 @@ end
                 run_tests(; test_dir = tdir)
             end
             @test isfile(seen)
-            # The active project during the QA file run was the qa/ group env, and the
-            # repo-root package was developed into it. Compare with `samefile` rather
-            # than string equality: on case-insensitive filesystems (macOS, Windows)
-            # the group folder is resolved to the requested casing ("QA"), so the
-            # recorded `active_project()` differs textually from the lowercase on-disk
-            # `qadir` while pointing at the same directory.
+            # The active project during the QA file run was the sandbox copy of the
+            # qa/ group env, with the repo-root package developed into it, and the
+            # env in the repo itself was left untouched.
             active = read(seen, String)
             @test basename(active) == "Project.toml"
-            @test samefile(dirname(active), qadir)
-            envdeps = Pkg.TOML.parsefile(joinpath(qadir, "Project.toml"))
+            @test !samefile(dirname(active), qadir)
+            envdeps = Pkg.TOML.parsefile(active)
             @test haskey(get(envdeps, "deps", Dict()), "TinyQAPkg")
+            @test read(joinpath(qadir, "Project.toml"), String) == ""
         finally
             Pkg.activate(original_project)
         end
