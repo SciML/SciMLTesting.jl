@@ -612,25 +612,41 @@ function with_clean_persistent_tasks_sources(f; verbose::Bool = false)
     end
 end
 
-# Aqua runs its ambiguity detector in a clean Julia process. That child receives the
-# caller's QA environment, where Aqua is intentionally not a direct dependency, so
-# also expose SciMLTesting's project while Aqua builds its child command.
+# Aqua runs its ambiguity detector in a clean Julia process. Preserve a caller's QA
+# environment when it declares Aqua directly; otherwise give the child an isolated
+# environment whose manifest resolves SciMLTesting's installed Aqua dependency.
 function _with_aqua_dependency_load_path(f)
-    package_root = pkgdir(@__MODULE__)
-    package_root === nothing && return f()
-    project_file = joinpath(package_root, "Project.toml")
-    isfile(project_file) || return f()
+    _active_project_declares_dependency(:Aqua) && return f()
 
+    aqua_root = pkgdir(Aqua)
+    aqua_root === nothing && return f()
     original_load_path = copy(LOAD_PATH)
-    if !(project_file in LOAD_PATH)
-        pushfirst!(LOAD_PATH, project_file)
+    original_project = Base.active_project()
+    return mktempdir() do environment
+        try
+            Pkg.activate(environment; io = devnull)
+            Pkg.develop(path = aqua_root; io = devnull)
+        finally
+            original_project === nothing ? Pkg.activate(; io = devnull) :
+                Pkg.activate(original_project; io = devnull)
+        end
+
+        pushfirst!(LOAD_PATH, environment)
+        try
+            return f()
+        finally
+            empty!(LOAD_PATH)
+            append!(LOAD_PATH, original_load_path)
+        end
     end
-    try
-        return f()
-    finally
-        empty!(LOAD_PATH)
-        append!(LOAD_PATH, original_load_path)
-    end
+end
+
+function _active_project_declares_dependency(name::Symbol)
+    project_file = Base.active_project()
+    (project_file === nothing || !isfile(project_file)) && return false
+    project = TOML.parsefile(project_file)
+    deps = get(project, "deps", nothing)
+    return deps isa AbstractDict && haskey(deps, string(name))
 end
 
 # For every dep of the active environment whose installed Project.toml declares a
@@ -996,8 +1012,22 @@ function _generated_enum_modules(pkg::Module)
     return Tuple(modules)
 end
 
+const BASE_BROADCAST_EXTENSION_HOOKS = (
+    :Broadcasted, :broadcastable, :dotview, :materialize!,
+)
+
 function _explicit_imports_kwargs(pkg::Module, name::Symbol, ei_kwargs)
     kwargs = NamedTuple(get(ei_kwargs, name, (;)))
+    if name === :all_qualified_accesses_are_public
+        # Julia's broadcast-extension protocol has no public spelling: packages must
+        # dispatch on these Base hooks to support dotted assignment and broadcasting.
+        # Keep that language-level exception here, rather than requiring every package
+        # to carry the same per-repository ExplicitImports ignore list.
+        kwargs = merge(
+            kwargs,
+            (; ignore = (get(kwargs, :ignore, ())..., BASE_BROADCAST_EXTENSION_HOOKS...)),
+        )
+    end
     name in (:no_implicit_imports, :no_stale_explicit_imports) || return kwargs
     generated_enums = _generated_enum_modules(pkg)
     isempty(generated_enums) && return kwargs
@@ -1020,6 +1050,10 @@ so this helper stays usable with any compatible module. `ei_kwargs`
 is a `NamedTuple` keyed by each check's short name (the part after `check_`); its
 value is that check's keyword arguments, so callers curate per-check ignore-lists,
 e.g. `ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:foo,)))`.
+SciMLTesting itself ignores Base's `Broadcasted`, `broadcastable`, `dotview`, and
+`materialize!` for the public-access check: they are required Julia broadcast
+extension hooks but Base does not declare them public. This global exception does not
+cover dependency-owned names.
 EnumX-generated child modules are automatically excluded from the two source-analysis
 checks: they contain macro-generated enum bindings but no package-authored imports to
 analyze.
