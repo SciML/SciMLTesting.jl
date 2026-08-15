@@ -1252,27 +1252,136 @@ function _doc_entry_name(line::AbstractString)
     return Symbol(tok)
 end
 
+# The scope of one ```@autodocs``` block, mirroring what Documenter's `AutoDocsBlocks`
+# expander does with the same settings. `nothing` means the setting could not be read
+# from the text, so that dimension stays unrestricted. `modules` holds each `Modules`
+# entry split into its dotted components.
+struct _AutoDocsBlock
+    modules::Union{Nothing, Vector{Vector{String}}}
+    pages::Union{Nothing, Vector{String}}
+    public::Bool
+    private::Bool
+end
+
+_AutoDocsBlock() = _AutoDocsBlock(nothing, nothing, true, true)
+
+_normalize_doc_path(path::AbstractString) =
+    replace(String(path), '\\' => '/', "./" => "")
+
+# `A` -> ["A"], `A.B` -> ["A", "B"]; anything else is not a module path.
+_module_path(sym::Symbol) = [String(sym)]
+function _module_path(ex::Expr)
+    (ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode) || return nothing
+    parent = _module_path(ex.args[1])
+    parent === nothing && return nothing
+    field = ex.args[2].value
+    field isa Symbol || return nothing
+    return push!(parent, String(field))
+end
+_module_path(::Any) = nothing
+
+# The elements of a `[...]` literal, or `nothing` if the value is not one.
+_autodocs_list(value) =
+    (value isa Expr && value.head === :vect) ? value.args : nothing
+
+function _autodocs_modules(value)
+    entries = _autodocs_list(value)
+    entries === nothing && return nothing
+    paths = Vector{String}[]
+    for entry in entries
+        path = _module_path(entry)
+        path === nothing && return nothing
+        push!(paths, _strip_main(path))
+    end
+    return paths
+end
+
+# A module defined at the REPL or in a test file sits under `Main`, which a manual
+# naming that module does not write.
+_strip_main(components::Vector{String}) =
+    (length(components) > 1 && first(components) == "Main") ? components[2:end] : components
+
+function _autodocs_pages(value)
+    entries = _autodocs_list(value)
+    entries === nothing && return nothing
+    all(entry -> entry isa AbstractString, entries) || return nothing
+    return String[_normalize_doc_path(entry) for entry in entries]
+end
+
+# The scope declared by a ```@autodocs``` block body (Julia `Key = value` assignments),
+# or `nothing` for a block that renders nothing: Documenter refuses a block with no
+# `Modules` (`'@autodocs' missing 'Modules = ...'`). Anything not decidable from the text
+# — a body that does not parse, a non-literal `Modules`/`Pages` entry, or the
+# `Filter`/`Order` settings, which narrow by evaluated value and by category — leaves
+# that dimension unrestricted, so a block read only partly still credits everything.
+function _parse_autodocs_block(body::AbstractString)
+    parsed = try
+        Meta.parseall(body; filename = "autodocs")
+    catch
+        return _AutoDocsBlock()
+    end
+    has_modules = false
+    modules = nothing
+    pages = nothing
+    public = true
+    private = true
+    for ex in parsed.args
+        (ex isa Expr && ex.head === :(=) && ex.args[1] isa Symbol) || continue
+        key = ex.args[1]::Symbol
+        value = ex.args[2]
+        if key === :Modules
+            has_modules = true
+            modules = _autodocs_modules(value)
+        elseif key === :Pages
+            pages = _autodocs_pages(value)
+        elseif key === :Public
+            public = value !== false
+        elseif key === :Private
+            private = value !== false
+        end
+    end
+    has_modules || return nothing
+    return _AutoDocsBlock(modules, pages, public, private)
+end
+
+function _push_autodocs_block!(blocks::Vector{_AutoDocsBlock}, body::AbstractString)
+    block = _parse_autodocs_block(body)
+    block === nothing || push!(blocks, block)
+    return blocks
+end
+
 # Scan every `*.md` file under `docs_src` and collect the set of names that appear
-# inside a ```@docs``` fenced block, plus whether any ```@autodocs``` block is present.
-# An `@autodocs` block renders whole modules' docstrings, so its presence means the
-# per-name "rendered" check cannot meaningfully single out a missing name — the caller
-# treats that as "everything documented is rendered". A missing `docs_src` yields an
-# empty set and `autodocs = false`.
+# inside a ```@docs``` fenced block, plus the scope of every ```@autodocs``` block.
+# An `@autodocs` block renders the docstrings its `Modules`/`Pages` settings select,
+# which may be a small corner of the package rather than all of it, so the caller
+# matches each public name against those scopes instead of taking any block as
+# whole-package coverage. A missing `docs_src` yields an empty set and no blocks.
 function _rendered_doc_names(docs_src::AbstractString)
     rendered = Set{Symbol}()
-    autodocs = false
+    autodocs = _AutoDocsBlock[]
     isdir(docs_src) || return (rendered, autodocs)
     for (dir, _, files) in walkdir(docs_src)
         for file in files
             endswith(file, ".md") || continue
             in_docs = false
+            body = IOBuffer()
+            in_autodocs = false
             for raw in eachline(joinpath(dir, file))
                 line = strip(raw)
+                if in_autodocs
+                    if startswith(line, "```")
+                        _push_autodocs_block!(autodocs, String(take!(body)))
+                        in_autodocs = false
+                    else
+                        println(body, raw)
+                    end
+                    continue
+                end
                 if startswith(line, "```@docs")
                     in_docs = true
                     continue
                 elseif startswith(line, "```@autodocs")
-                    autodocs = true
+                    in_autodocs = true
                     in_docs = false
                     continue
                 elseif in_docs && startswith(line, "```")
@@ -1283,10 +1392,84 @@ function _rendered_doc_names(docs_src::AbstractString)
                 (isempty(line) || startswith(line, "#")) && continue
                 push!(rendered, _doc_entry_name(line))
             end
+            in_autodocs && _push_autodocs_block!(autodocs, String(take!(body)))
         end
     end
     return (rendered, autodocs)
 end
+
+function _doc_binding(pkg::Module, name::Symbol)
+    isdefined(pkg, name) || return nothing
+    return try
+        Base.Docs.Binding(pkg, name)
+    catch
+        nothing
+    end
+end
+
+# Documenter decides `Public`/`Private` membership with `Base.ispublic` where it exists
+# and `Base.isexported` before that (`DocSystem.APIStatus`), against the module whose
+# docstring table the entry came from.
+@static if VERSION >= v"1.11"
+    _doc_is_public(mod::Module, name::Symbol) = Base.ispublic(mod, name)
+else
+    _doc_is_public(mod::Module, name::Symbol) = Base.isexported(mod, name)
+end
+
+# Where `pkg.name`'s docstrings live, as `(storage module, source path)` pairs — the two
+# coordinates an `@autodocs` block selects on. Documenter reads exactly this table
+# (`DocSystem.getmeta(mod) = Docs.meta(mod)`), which has no public equivalent, so every
+# step is guarded. The fallback for an unreachable docstring — `pkg` with no source path
+# — still lets a `Modules`-scoped block credit the name, while a `Pages`-scoped block,
+# which needs a real path to match, does not.
+function _docstring_entries(pkg::Module, name::Symbol)
+    entries = Tuple{Module, String}[]
+    binding = _doc_binding(pkg, name)
+    if binding !== nothing
+        owner = binding.mod
+        for mod in (owner === pkg ? (pkg,) : (owner, pkg))
+            meta = try
+                Base.Docs.meta(mod; autoinit = false)
+            catch
+                nothing
+            end
+            meta === nothing && continue
+            multidoc = get(meta, binding, nothing)
+            multidoc === nothing && continue
+            for docstr in values(multidoc.docs)
+                path = get(docstr.data, :path, nothing)
+                push!(entries, (mod, path === nothing ? "" : _normalize_doc_path(string(path))))
+            end
+        end
+    end
+    isempty(entries) && push!(entries, (pkg, ""))
+    return entries
+end
+
+# A module's dotted name as the manual would write it. Comparison is by name, so a
+# `Modules` entry written through an import alias is not recognized as that module.
+_module_components(mod::Module) = _strip_main(String[String(c) for c in fullname(mod)])
+
+function _autodocs_renders(block::_AutoDocsBlock, entry::Tuple{Module, String}, name::Symbol)
+    (mod, path) = entry
+    (_doc_is_public(mod, name) ? block.public : block.private) || return false
+    # Documenter collects docstrings from the listed modules themselves, so a submodule
+    # of a listed module is not covered unless it is listed too.
+    if block.modules !== nothing
+        components = _module_components(mod)
+        any(==(components), block.modules) || return false
+    end
+    if block.pages !== nothing
+        (!isempty(path) && any(page -> endswith(path, page), block.pages)) || return false
+    end
+    return true
+end
+
+_rendered_by_autodocs(pkg::Module, name::Symbol, blocks::Vector{_AutoDocsBlock}) =
+    !isempty(blocks) && any(
+    entry -> any(block -> _autodocs_renders(block, entry, name), blocks),
+    _docstring_entries(pkg, name),
+)
 
 function _docs_project_declares(docs_src, package_name)
     project_file = joinpath(dirname(docs_src), "Project.toml")
@@ -1364,9 +1547,19 @@ Two checks, each its own nested `@testset`:
     ```` ```@docs ```` block somewhere under `docs_src`, so it is rendered in the
     manual. Re-exported modules inherit the defining package's rendered module
     documentation, while re-exported functions and types still require a local entry.
-    Packages without a resolvable local manual must explicitly set `rendered = false`. If any
-    ```` ```@autodocs ```` block is present the check passes wholesale — `@autodocs`
-    renders whole modules, so anything with a docstring is already rendered.
+    Packages without a resolvable local manual must explicitly set `rendered = false`. A
+    name also counts as rendered when a ```` ```@autodocs ```` block covers one of its
+    docstrings, decided per name from that block's `Modules`, `Pages`, `Public` and
+    `Private` settings rather than treating any block as whole-package coverage: a block
+    scoped to one source file renders that file and nothing else. The settings are read
+    as literals, never evaluated, and follow Documenter: a block with no `Modules` renders
+    nothing, `Modules` entries name the modules whose docstrings are collected and do not
+    extend to their submodules, and `Pages` entries match a docstring's source file by
+    suffix. A setting that cannot be read as a literal, and the `Filter`/`Order` settings,
+    which narrow by evaluated value and by category, leave that dimension unrestricted, so
+    a block the check cannot fully read still credits everything. Names a block does not
+    cover, e.g. because the manual writes a module under an import alias, go in
+    `rendered_ignore`.
 
 `docs_src` defaults to `<pkgroot>/docs/src` located via `pkgdir(pkg)`. For a
 conventional monorepo subpackage at `lib/<PackageName>`, it also discovers the
@@ -1434,12 +1627,13 @@ function run_api_docs(
         if rendered
             (rendered_names, autodocs) = _rendered_doc_names(docs_src)
             skip = Set{Symbol}(Symbol.(rendered_ignore))
-            unrendered = autodocs ? Symbol[] : sort!(
-                    filter(
-                        n -> _requires_local_rendering(pkg, n) && !(n in skip) && !(n in rendered_names),
-                        api,
-                    )
+            unrendered = sort!(
+                filter(
+                    n -> _requires_local_rendering(pkg, n) && !(n in skip) &&
+                        !(n in rendered_names) && !_rendered_by_autodocs(pkg, n, autodocs),
+                    api,
                 )
+            )
             @testset "public API is rendered in docs" begin
                 rendered_broken ? (@test_broken isempty(unrendered)) :
                     (@test isempty(unrendered))

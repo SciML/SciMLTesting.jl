@@ -203,6 +203,18 @@ module LocalModuleFixture
     export LocalSubmodule
 end
 
+# Fixture for the scoped-```@autodocs``` rendered check. Every public name is
+# documented here, so its docstrings resolve to this module and to this source file
+# and an `@autodocs` block can be shown to cover them exactly when its `Modules` /
+# `Pages` / `Public` scope really selects them.
+module ScopedAutoDocsFixture
+    export scoped_documented, ScopedDocumentedType
+    "scoped_documented doc"
+    scoped_documented(x) = x
+    "ScopedDocumentedType doc"
+    struct ScopedDocumentedType end
+end
+
 # Reexports an undocumented external module and an undocumented external function
 # next to an undocumented local name, so the docstrings check can be shown to exempt
 # the module and only the module.
@@ -1169,21 +1181,60 @@ end
         write(joinpath(src, "prose.md"), "# Just prose\n\nno docs block here\n")
         (rendered, autodocs) = SciMLTesting._rendered_doc_names(src)
         @test rendered == Set([:foo, :bar, Symbol("@mac"), :baz])
-        @test autodocs == false
+        @test isempty(autodocs)
 
-        # An @autodocs block flips the wholesale flag.
+        # Each @autodocs block is captured with the scope it declares, so a narrow
+        # block stays narrow instead of reading as whole-package coverage.
         adroot = mktempdir()
         asrc = joinpath(adroot, "src"); mkpath(asrc)
         write(
             joinpath(asrc, "api.md"),
-            "# API\n\n```@autodocs\nModules = [MyPkg]\n```\n",
+            """
+            # API
+
+            ```@autodocs
+            Modules = [MyPkg, MyPkg.Inner]
+            Pages = ["systems/analysis_points.jl"]
+            Private = false
+            ```
+
+            ```@autodocs
+            Modules = [MyPkg]
+            ```
+            """,
         )
-        (_, autodocs2) = SciMLTesting._rendered_doc_names(asrc)
-        @test autodocs2 == true
+        (_, blocks) = SciMLTesting._rendered_doc_names(asrc)
+        @test length(blocks) == 2
+        @test blocks[1].modules == [["MyPkg"], ["MyPkg", "Inner"]]
+        @test blocks[1].pages == ["systems/analysis_points.jl"]
+        @test blocks[1].public && !blocks[1].private
+        @test blocks[2].modules == [["MyPkg"]]
+        @test blocks[2].pages === nothing
+        @test blocks[2].public && blocks[2].private
+
+        # Settings that cannot be read as literals leave the block unrestricted, keeping
+        # the pre-scoping "renders everything" behaviour rather than evaluating them.
+        uroot = mktempdir()
+        usrc = joinpath(uroot, "src"); mkpath(usrc)
+        write(
+            joinpath(usrc, "api.md"),
+            "```@autodocs\nModules = collect_modules()\nFilter = t -> false\n```\n",
+        )
+        (_, unreadable) = SciMLTesting._rendered_doc_names(usrc)
+        @test length(unreadable) == 1
+        @test unreadable[1].modules === nothing
+        @test unreadable[1].pages === nothing
+
+        # Documenter renders nothing for a block with no `Modules`, so it is dropped
+        # instead of being read as unrestricted coverage.
+        mroot = mktempdir()
+        msrc = joinpath(mroot, "src"); mkpath(msrc)
+        write(joinpath(msrc, "api.md"), "```@autodocs\nPages = [\"a.jl\"]\n```\n")
+        @test isempty(last(SciMLTesting._rendered_doc_names(msrc)))
 
         # A missing docs dir yields an empty set (never errors).
         (empty_rendered, empty_auto) = SciMLTesting._rendered_doc_names(joinpath(droot, "nope"))
-        @test isempty(empty_rendered) && empty_auto == false
+        @test isempty(empty_rendered) && isempty(empty_auto)
     end
 
     @testset "_find_docs_src" begin
@@ -1446,9 +1497,52 @@ end
         end
         @test c[:fail] == 1
 
-        # An @autodocs block satisfies the rendered check wholesale (no per-name list).
+        # An @autodocs block counts only for the names its own scope renders.
         adroot = mktempdir()
         asrc = joinpath(adroot, "src"); mkpath(asrc)
+        function autodocs_counts(settings)
+            write(joinpath(asrc, "api.md"), "```@autodocs\n" * settings * "```\n")
+            return counts_of() do
+                run_api_docs(
+                    ScopedAutoDocsFixture;
+                    docstrings = false, rendered = true, docs_src = asrc,
+                )
+            end
+        end
+
+        # Scoped to the module, and to the file, the docstrings really come from.
+        for settings in (
+                "Modules = [ScopedAutoDocsFixture]\n",
+                "Modules = [Main.ScopedAutoDocsFixture]\n",
+                "Modules = [ScopedAutoDocsFixture]\nPages = [\"runtests.jl\"]\n",
+                "Modules = [ScopedAutoDocsFixture]\nPrivate = false\n",
+                "Modules = [ScopedAutoDocsFixture]\nFilter = t -> false\n",
+            )
+            c = autodocs_counts(settings)
+            @test c[:fail] == 0 && c[:error] == 0 && c[:pass] == 1
+        end
+
+        # Scoped to another module, to a module path that is not this one (including one
+        # longer than the module's own name), to another source file, or away from public
+        # names: the public API is not rendered, and a narrow block must not hide that.
+        for settings in (
+                "Modules = [SomeOtherPackage]\n",
+                "Modules = [Outer.Nested.ScopedAutoDocsFixture]\n",
+                "Modules = [ScopedAutoDocsFixture]\nPages = [\"systems/analysis_points.jl\"]\n",
+                "Modules = [ScopedAutoDocsFixture]\nPublic = false\n",
+            )
+            c = autodocs_counts(settings)
+            @test c[:fail] == 1
+        end
+
+        # Documenter renders nothing for a `Modules`-less block, so one cannot stand in
+        # for a rendered API either.
+        c = autodocs_counts("Pages = [\"runtests.jl\"]\n")
+        @test c[:fail] == 1
+
+        # A public name whose docstring the docsystem cannot locate falls back to the
+        # package itself, so a module-scoped block still covers ApiFixture's
+        # undocumented exports rather than reporting them twice.
         write(joinpath(asrc, "api.md"), "```@autodocs\nModules = [ApiFixture]\n```\n")
         c = counts_of() do
             run_api_docs(ApiFixture; docstrings = false, rendered = true, docs_src = asrc)
