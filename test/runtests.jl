@@ -219,6 +219,11 @@ module ScopedAutoDocsFixture
     struct ScopedDocumentedType end
 end
 
+module RealJETFixture
+    export real_jet_identity
+    real_jet_identity(x) = x
+end
+
 # Reexports an undocumented external module and an undocumented external function
 # next to an undocumented local name, so the docstrings check can be shown to exempt
 # the module and only the module.
@@ -563,14 +568,27 @@ end
             SciMLTesting, (; target_modules = (Base,))
         ).target_modules == (Base,)
 
-        # `target_defined_modules` is JET's deprecated spelling of `target_modules`, so it
-        # owns that slot: the default must not also inject `target_modules` alongside it.
-        deprecated = SciMLTesting._standard_jet_kwargs(
+        # `target_defined_modules` is a separate JET configuration. `false` does not
+        # replace the standard target_modules filter; `true` asks JET to derive its own
+        # target set and therefore replaces only the default target.
+        disabled = SciMLTesting._standard_jet_kwargs(
+            SciMLTesting, (; target_defined_modules = false)
+        )
+        @test disabled.mode === :typo
+        @test disabled.target_defined_modules === false
+        @test disabled.target_modules == (SciMLTesting,)
+
+        derived = SciMLTesting._standard_jet_kwargs(
             SciMLTesting, (; target_defined_modules = true)
         )
-        @test deprecated.mode === :typo
-        @test deprecated.target_defined_modules === true
-        @test !haskey(deprecated, :target_modules)
+        @test derived.mode === :typo
+        @test derived.target_defined_modules === true
+        @test !haskey(derived, :target_modules)
+
+        explicit = SciMLTesting._standard_jet_kwargs(
+            SciMLTesting, (; target_defined_modules = true, target_modules = (Base,))
+        )
+        @test explicit.target_modules == (Base,)
 
         # Helpful errors when an enable flag is forced on but the module is unavailable.
         @test_throws ArgumentError run_qa(
@@ -586,6 +604,18 @@ end
         @test_throws ArgumentError run_qa(
             SciMLTesting; Aqua = nothing, JET = nothing,
             ExplicitImports = nothing, explicit_imports = true, api_docs = false
+        )
+    end
+
+    @testset "real JET target_defined_modules precedence" begin
+        # Newer supported JET versions removed the legacy keyword, so FakeJET checks
+        # forwarding of that key above while real JET checks the resulting target path.
+        effective = SciMLTesting._standard_jet_kwargs(
+            RealJETFixture, (; target_defined_modules = false)
+        )
+        @test effective.target_modules == (RealJETFixture,)
+        JET.test_package(
+            RealJETFixture; mode = effective.mode, target_modules = effective.target_modules
         )
     end
 
@@ -1242,12 +1272,14 @@ end
         @test blocks[1].modules == [["MyPkg"], ["MyPkg", "Inner"]]
         @test blocks[1].pages == ["systems/analysis_points.jl"]
         @test blocks[1].public && !blocks[1].private
+        @test blocks[1].order == [:module, :constant, :type, :function, :macro]
+        @test blocks[1].unfiltered
         @test blocks[2].modules == [["MyPkg"]]
-        @test blocks[2].pages === nothing
+        @test isempty(blocks[2].pages)
         @test blocks[2].public && blocks[2].private
 
-        # Settings that cannot be read as literals leave the block unrestricted, keeping
-        # the pre-scoping "renders everything" behaviour rather than evaluating them.
+        # Settings that cannot be read as literals are retained for diagnostics but cannot
+        # satisfy the rendered check.
         uroot = mktempdir()
         usrc = joinpath(uroot, "src"); mkpath(usrc)
         write(
@@ -1257,7 +1289,8 @@ end
         (_, unreadable) = SciMLTesting._rendered_doc_names(usrc)
         @test length(unreadable) == 1
         @test unreadable[1].modules === nothing
-        @test unreadable[1].pages === nothing
+        @test isempty(unreadable[1].pages)
+        @test !unreadable[1].unfiltered
 
         # Documenter renders nothing for a block with no `Modules`, so it is dropped
         # instead of being read as unrestricted coverage.
@@ -1550,7 +1583,7 @@ end
                 "Modules = [Main.ScopedAutoDocsFixture]\n",
                 "Modules = [ScopedAutoDocsFixture]\nPages = [\"runtests.jl\"]\n",
                 "Modules = [ScopedAutoDocsFixture]\nPrivate = false\n",
-                "Modules = [ScopedAutoDocsFixture]\nFilter = t -> false\n",
+                "Modules = [ScopedAutoDocsFixture]\nOrder = [:function, :type]\n",
             )
             c = autodocs_counts(settings)
             @test c[:fail] == 0 && c[:error] == 0 && c[:pass] == 1
@@ -1564,6 +1597,11 @@ end
                 "Modules = [Outer.Nested.ScopedAutoDocsFixture]\n",
                 "Modules = [ScopedAutoDocsFixture]\nPages = [\"systems/analysis_points.jl\"]\n",
                 "Modules = [ScopedAutoDocsFixture]\nPublic = false\n",
+                "Modules = [ScopedAutoDocsFixture]\nFilter = t -> false\n",
+                "Modules = [ScopedAutoDocsFixture]\nFilter = dynamic_filter\n",
+                "Modules = [ScopedAutoDocsFixture]\nOrder = [:type]\n",
+                "Modules = [ScopedAutoDocsFixture]\nOrder = dynamic_order\n",
+                "Modules = filter(_ -> false, [ScopedAutoDocsFixture])\n",
             )
             c = autodocs_counts(settings)
             @test c[:fail] == 1

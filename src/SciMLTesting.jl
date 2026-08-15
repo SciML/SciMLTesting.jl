@@ -749,9 +749,11 @@ Each tool runs if it is both available and enabled:
   * `Aqua` + `aqua` ⇒ `Aqua.test_all(pkg; aqua_kwargs...)`,
   * `JET` + `jet` ⇒ `JET.test_package(pkg; jet_kwargs...)`, where `jet_kwargs` is merged
     over the standard `(; target_modules = (pkg,), mode = :typo)` rather than replacing
-    it, so a partial override keeps the standard setting for every key it omits. Passing
-    JET's deprecated `target_defined_modules` suppresses the `target_modules` default,
-    since the two configure the same thing.
+    it, so a partial override keeps the standard setting for every key it omits.
+    `target_defined_modules = true` asks JET to derive its target modules and replaces
+    the default target; `false` leaves the default `target_modules` filter in place.
+    Newer JET versions have removed this deprecated option, so callers should prefer
+    `target_modules` when configuring JET directly.
   * `ExplicitImports` + `explicit_imports` ⇒ ExplicitImports' standard + public-API
     checks (see [`run_explicit_imports`](@ref)).
   * `api_docs` ⇒ the public-API documentation check (see [`run_api_docs`](@ref)): every
@@ -997,11 +999,13 @@ end
 # Fill in the standard JET configuration for every key the caller did not mention. This
 # must merge rather than replace: as a whole-NamedTuple default, any `jet_kwargs` at all
 # dropped `mode = :typo` and silently reverted JET to its far more expensive `BasicPass`.
-# `target_defined_modules` is JET's deprecated spelling of `target_modules`, so a caller
-# passing it already owns that slot and must not also receive `target_modules`.
+# `target_defined_modules` is a separate JET configuration: when true, JET derives its
+# report target modules from the modules it analyzed. It therefore replaces the default
+# target only in that case; `false` still leaves the standard target_modules filter active.
 function _standard_jet_kwargs(pkg::Module, jet_kwargs)
     nt = NamedTuple(jet_kwargs)
-    defaults = haskey(nt, :target_defined_modules) ? (; mode = :typo) :
+    defaults = get(nt, :target_defined_modules, false) === true && !haskey(nt, :target_modules) ?
+        (; mode = :typo) :
         (; target_modules = (pkg,), mode = :typo)
     return merge(defaults, nt)
 end
@@ -1270,17 +1274,21 @@ function _doc_entry_name(line::AbstractString)
 end
 
 # The scope of one ```@autodocs``` block, mirroring what Documenter's `AutoDocsBlocks`
-# expander does with the same settings. `nothing` means the setting could not be read
-# from the text, so that dimension stays unrestricted. `modules` holds each `Modules`
-# entry split into its dotted components.
+# expander does with the same settings. An unknown scope is represented by `nothing` and
+# never credits a name: the QA check must fail closed when it cannot prove that a name is
+# rendered. `modules` holds each `Modules` entry split into its dotted components.
 struct _AutoDocsBlock
     modules::Union{Nothing, Vector{Vector{String}}}
     pages::Union{Nothing, Vector{String}}
-    public::Bool
-    private::Bool
+    public::Union{Nothing, Bool}
+    private::Union{Nothing, Bool}
+    order::Union{Nothing, Vector{Symbol}}
+    unfiltered::Bool
 end
 
-_AutoDocsBlock() = _AutoDocsBlock(nothing, nothing, true, true)
+_AutoDocsBlock() = _AutoDocsBlock(nothing, nothing, nothing, nothing, nothing, false)
+
+const _AUTODOCS_DEFAULT_ORDER = Symbol[:module, :constant, :type, :function, :macro]
 
 _normalize_doc_path(path::AbstractString) =
     replace(String(path), '\\' => '/', "./" => "")
@@ -1325,12 +1333,19 @@ function _autodocs_pages(value)
     return String[_normalize_doc_path(entry) for entry in entries]
 end
 
+function _autodocs_order(value)
+    entries = _autodocs_list(value)
+    entries === nothing && return nothing
+    all(entry -> entry isa QuoteNode && entry.value isa Symbol, entries) || return nothing
+    return Symbol[entry.value for entry in entries]
+end
+
 # The scope declared by a ```@autodocs``` block body (Julia `Key = value` assignments),
 # or `nothing` for a block that renders nothing: Documenter refuses a block with no
 # `Modules` (`'@autodocs' missing 'Modules = ...'`). Anything not decidable from the text
-# — a body that does not parse, a non-literal `Modules`/`Pages` entry, or the
-# `Filter`/`Order` settings, which narrow by evaluated value and by category — leaves
-# that dimension unrestricted, so a block read only partly still credits everything.
+# — a body that does not parse, a non-literal `Modules`/`Pages`/`Order`/`Public`/`Private`
+# entry, or any `Filter` — is treated as rendering no names. This deliberately fails
+# closed rather than allowing a partial parser to hide undocumented public API.
 function _parse_autodocs_block(body::AbstractString)
     parsed = try
         Meta.parseall(body; filename = "autodocs")
@@ -1339,9 +1354,11 @@ function _parse_autodocs_block(body::AbstractString)
     end
     has_modules = false
     modules = nothing
-    pages = nothing
+    pages = String[]
     public = true
     private = true
+    order = _AUTODOCS_DEFAULT_ORDER
+    unfiltered = true
     for ex in parsed.args
         (ex isa Expr && ex.head === :(=) && ex.args[1] isa Symbol) || continue
         key = ex.args[1]::Symbol
@@ -1351,14 +1368,18 @@ function _parse_autodocs_block(body::AbstractString)
             modules = _autodocs_modules(value)
         elseif key === :Pages
             pages = _autodocs_pages(value)
+        elseif key === :Order
+            order = _autodocs_order(value)
         elseif key === :Public
-            public = value !== false
+            public = value isa Bool ? value : nothing
         elseif key === :Private
-            private = value !== false
+            private = value isa Bool ? value : nothing
+        elseif key === :Filter
+            unfiltered = false
         end
     end
     has_modules || return nothing
-    return _AutoDocsBlock(modules, pages, public, private)
+    return _AutoDocsBlock(modules, pages, public, private, order, unfiltered)
 end
 
 function _push_autodocs_block!(blocks::Vector{_AutoDocsBlock}, body::AbstractString)
@@ -1424,6 +1445,20 @@ function _doc_binding(pkg::Module, name::Symbol)
     end
 end
 
+function _doc_category(binding)
+    startswith(String(binding.var), "@") && return :macro
+    value = try
+        getfield(binding.mod, binding.var)
+    catch
+        return nothing
+    end
+    value isa Function && return :function
+    value isa DataType && return :type
+    value isa UnionAll && return :type
+    value isa Module && return :module
+    return :constant
+end
+
 # Documenter decides `Public`/`Private` membership with `Base.ispublic` where it exists
 # and `Base.isexported` before that (`DocSystem.APIStatus`), against the module whose
 # docstring table the entry came from.
@@ -1440,7 +1475,7 @@ end
 # — still lets a `Modules`-scoped block credit the name, while a `Pages`-scoped block,
 # which needs a real path to match, does not.
 function _docstring_entries(pkg::Module, name::Symbol)
-    entries = Tuple{Module, String}[]
+    entries = Tuple{Module, String, Union{Nothing, Symbol}}[]
     binding = _doc_binding(pkg, name)
     if binding !== nothing
         owner = binding.mod
@@ -1453,13 +1488,19 @@ function _docstring_entries(pkg::Module, name::Symbol)
             meta === nothing && continue
             multidoc = get(meta, binding, nothing)
             multidoc === nothing && continue
+            category = _doc_category(binding)
             for docstr in values(multidoc.docs)
                 path = get(docstr.data, :path, nothing)
-                push!(entries, (mod, path === nothing ? "" : _normalize_doc_path(string(path))))
+                push!(
+                    entries,
+                    (mod, path === nothing ? "" : _normalize_doc_path(string(path)), category),
+                )
             end
         end
     end
-    isempty(entries) && push!(entries, (pkg, ""))
+    isempty(entries) && push!(
+        entries, (pkg, "", binding === nothing ? nothing : _doc_category(binding))
+    )
     return entries
 end
 
@@ -1467,16 +1508,27 @@ end
 # `Modules` entry written through an import alias is not recognized as that module.
 _module_components(mod::Module) = _strip_main(String[String(c) for c in fullname(mod)])
 
-function _autodocs_renders(block::_AutoDocsBlock, entry::Tuple{Module, String}, name::Symbol)
-    (mod, path) = entry
-    (_doc_is_public(mod, name) ? block.public : block.private) || return false
+function _autodocs_renders(
+        block::_AutoDocsBlock,
+        entry::Tuple{Module, String, Union{Nothing, Symbol}},
+        name::Symbol,
+    )
+    (mod, path, category) = entry
+    block.modules === nothing && return false
+    block.pages === nothing && return false
+    block.order === nothing && return false
+    block.unfiltered || return false
+    included = _doc_is_public(mod, name) ? block.public : block.private
+    included === true || return false
+    category === nothing && return false
+    category in block.order || return false
     # Documenter collects docstrings from the listed modules themselves, so a submodule
     # of a listed module is not covered unless it is listed too.
     if block.modules !== nothing
         components = _module_components(mod)
         any(==(components), block.modules) || return false
     end
-    if block.pages !== nothing
+    if !isempty(block.pages)
         (!isempty(path) && any(page -> endswith(path, page), block.pages)) || return false
     end
     return true
@@ -1572,9 +1624,8 @@ Two checks, each its own nested `@testset`:
     as literals, never evaluated, and follow Documenter: a block with no `Modules` renders
     nothing, `Modules` entries name the modules whose docstrings are collected and do not
     extend to their submodules, and `Pages` entries match a docstring's source file by
-    suffix. A setting that cannot be read as a literal, and the `Filter`/`Order` settings,
-    which narrow by evaluated value and by category, leave that dimension unrestricted, so
-    a block the check cannot fully read still credits everything. Names a block does not
+    suffix. A setting that cannot be read as a literal, or a `Filter`/`Order` setting that
+    the check cannot prove to include a name, credits no names. Names a block does not
     cover, e.g. because the manual writes a module under an import alias, go in
     `rendered_ignore`.
 
