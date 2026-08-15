@@ -729,7 +729,7 @@ end
            aqua = Aqua !== nothing, jet = JET !== nothing,
            explicit_imports = true, api_docs = true, check_reexports = true,
            clean_sources = true,
-           aqua_kwargs = (;), jet_kwargs = (; target_modules = (pkg,), mode = :typo),
+           aqua_kwargs = (;), jet_kwargs = (;),
            ei_kwargs = (;), api_docs_kwargs = (;), reexports_allow = (),
            aqua_broken = (), jet_broken = false, ei_broken = (),
            testset = "Quality Assurance")
@@ -747,7 +747,11 @@ module; `run_qa` then picks it up. The typical call collapses to just
 Each tool runs if it is both available and enabled:
 
   * `Aqua` + `aqua` ⇒ `Aqua.test_all(pkg; aqua_kwargs...)`,
-  * `JET` + `jet` ⇒ `JET.test_package(pkg; jet_kwargs...)`,
+  * `JET` + `jet` ⇒ `JET.test_package(pkg; jet_kwargs...)`, where `jet_kwargs` is merged
+    over the standard `(; target_modules = (pkg,), mode = :typo)` rather than replacing
+    it, so a partial override keeps the standard setting for every key it omits. Passing
+    JET's deprecated `target_defined_modules` suppresses the `target_modules` default,
+    since the two configure the same thing.
   * `ExplicitImports` + `explicit_imports` ⇒ ExplicitImports' standard + public-API
     checks (see [`run_explicit_imports`](@ref)).
   * `api_docs` ⇒ the public-API documentation check (see [`run_api_docs`](@ref)): every
@@ -882,7 +886,7 @@ function run_qa(
         reexports_allow = (),
         clean_sources::Bool = true,
         aqua_kwargs = (;),
-        jet_kwargs = (; target_modules = (pkg,), mode = :typo),
+        jet_kwargs = (;),
         ei_kwargs = (;),
         api_docs_kwargs = (;),
         aqua_broken = (),
@@ -923,11 +927,12 @@ function run_qa(
                 run_aqua_with_dependencies()
         end
         if jet
+            effective_jet_kwargs = _standard_jet_kwargs(pkg, jet_kwargs)
             if jet_broken
-                rep = JET.report_package(pkg; _jet_report_kwargs(jet_kwargs)...)
+                rep = JET.report_package(pkg; _jet_report_kwargs(effective_jet_kwargs)...)
                 @test_broken isempty(JET.get_reports(rep))
             else
-                JET.test_package(pkg; jet_kwargs...)
+                JET.test_package(pkg; effective_jet_kwargs...)
             end
         end
         explicit_imports && run_explicit_imports(pkg, ExplicitImports; ei_kwargs, ei_broken)
@@ -987,6 +992,18 @@ function _standard_aqua_kwargs(aqua_kwargs, extension_functions = _solver_extens
     existing === nothing || append!(treat_as_own, existing)
     append!(treat_as_own, extension_functions)
     return merge(kwargs, (; piracies = merge(piracies, (; treat_as_own = unique(treat_as_own)))))
+end
+
+# Fill in the standard JET configuration for every key the caller did not mention. This
+# must merge rather than replace: as a whole-NamedTuple default, any `jet_kwargs` at all
+# dropped `mode = :typo` and silently reverted JET to its far more expensive `BasicPass`.
+# `target_defined_modules` is JET's deprecated spelling of `target_modules`, so a caller
+# passing it already owns that slot and must not also receive `target_modules`.
+function _standard_jet_kwargs(pkg::Module, jet_kwargs)
+    nt = NamedTuple(jet_kwargs)
+    defaults = haskey(nt, :target_defined_modules) ? (; mode = :typo) :
+        (; target_modules = (pkg,), mode = :typo)
+    return merge(defaults, nt)
 end
 
 # `JET.report_package` is report-only and takes JET config keys via `jetconfigs...`

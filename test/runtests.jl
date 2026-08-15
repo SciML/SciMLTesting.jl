@@ -26,9 +26,13 @@ end
 module FakeJET
     using Test: @test
     import ..SciMLTesting
+    # Records what test_package actually received so a test can assert that a partial
+    # `jet_kwargs` override still carries the standard configuration for the keys it omits.
+    const LAST_TEST_KWARGS = Ref{Any}(nothing)
     function test_package(pkg; target_modules = nothing, mode = nothing, kwargs...)
         @test pkg === SciMLTesting
         @test mode === :typo
+        LAST_TEST_KWARGS[] = (; target_modules, mode, kwargs...)
         return true
     end
     # report_package variant for jet_broken. Returns a fake "result" carrying a list of
@@ -525,6 +529,36 @@ end
             explicit_imports = false,
             api_docs = false,
         )
+
+        # A partial `jet_kwargs` override merges over the standard configuration instead
+        # of replacing it. Regression: `jet_kwargs` used to be a whole-NamedTuple default,
+        # so passing any entry dropped `mode = :typo` and silently reverted JET to its far
+        # more expensive `BasicPass`.
+        FakeJET.LAST_TEST_KWARGS[] = nothing
+        run_qa(
+            SciMLTesting; Aqua = nothing, JET = FakeJET, ExplicitImports = nothing,
+            explicit_imports = false, api_docs = false,
+            jet_kwargs = (; ignore_throws = false),
+        )
+        @test FakeJET.LAST_TEST_KWARGS[].mode === :typo
+        @test FakeJET.LAST_TEST_KWARGS[].target_modules == (SciMLTesting,)
+        @test FakeJET.LAST_TEST_KWARGS[].ignore_throws === false
+
+        # An explicit entry still wins over the default it collides with.
+        @test SciMLTesting._standard_jet_kwargs(SciMLTesting, (; mode = :sound)).mode ===
+            :sound
+        @test SciMLTesting._standard_jet_kwargs(
+            SciMLTesting, (; target_modules = (Base,))
+        ).target_modules == (Base,)
+
+        # `target_defined_modules` is JET's deprecated spelling of `target_modules`, so it
+        # owns that slot: the default must not also inject `target_modules` alongside it.
+        deprecated = SciMLTesting._standard_jet_kwargs(
+            SciMLTesting, (; target_defined_modules = true)
+        )
+        @test deprecated.mode === :typo
+        @test deprecated.target_defined_modules === true
+        @test !haskey(deprecated, :target_modules)
 
         # Helpful errors when an enable flag is forced on but the module is unavailable.
         @test_throws ArgumentError run_qa(
