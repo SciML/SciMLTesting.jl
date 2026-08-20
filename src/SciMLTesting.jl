@@ -43,6 +43,7 @@ auto-registers it and turns the JET check on.
 module SciMLTesting
 
 using Pkg: Pkg
+using PrecompileTools: @compile_workload, @setup_workload
 using TOML: TOML
 using Test: Test, @testset, @test, @test_broken
 using SafeTestsets: SafeTestsets, @safetestset
@@ -2496,6 +2497,14 @@ function _run_group_spec(spec::GroupSpec, default_parent; label::AbstractString 
     end
     _run_body(spec.body; label = label)
     return nothing
+end
+
+@setup_workload begin
+    @compile_workload begin
+        current_group(default = "Core")
+        public_api_names(SciMLTesting)
+        public_reexports(SciMLTesting)
+    end
 end
 
 _as_string_dict(d::AbstractDict) = Dict{String, Any}(string(k) => v for (k, v) in d)
