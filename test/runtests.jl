@@ -272,6 +272,8 @@ function Test.finish(ts::ProbeTestSet)
     return ts
 end
 
+using ExplicitImports
+
 @testset "SciMLTesting" begin
     @testset "current_group" begin
         # Default when unset.
@@ -923,6 +925,11 @@ end
             ei_kwargs = (; all_qualified_accesses_are_public = (; ignore = (:internal_thing,))),
         )
         @test FakeExplicitImports.PUBLIC_CALLED[] == (VERSION >= v"1.11")
+    end
+
+    @testset "SciMLTesting source analyzability" begin
+        @test ExplicitImports.check_no_implicit_imports(SciMLTesting) === nothing
+        @test ExplicitImports.check_no_stale_explicit_imports(SciMLTesting) === nothing
     end
 
     @testset "generated enum modules are excluded from source analysis" begin

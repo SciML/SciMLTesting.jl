@@ -46,7 +46,7 @@ using Pkg: Pkg
 using PrecompileTools: @compile_workload, @setup_workload
 using TOML: TOML
 using Test: Test, @testset, @test, @test_broken
-using SafeTestsets: SafeTestsets, @safetestset
+using SafeTestsets: SafeTestsets
 using Aqua: Aqua
 using ExplicitImports: ExplicitImports
 # REPL provides the public `@doc` lookup used on Julia 1.10, before `Docs.hasdoc`
@@ -1891,7 +1891,7 @@ function _run_body(body; label::AbstractString = "Group")
             GlobalRef(SafeTestsets, Symbol("@safetestset")),
             LineNumberNode(@__LINE__, @__FILE__),
             string(label),
-            Expr(:block, :(include($path))),
+            Expr(:block, Expr(:call, :include, path)),
         )
         Core.eval(Main, expr)
     elseif _callable(body)
