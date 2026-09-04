@@ -23,9 +23,12 @@ SciMLTestingJETExt = "JET"
 Aqua = "0.8"
 ExplicitImports = "1"
 JET = "0.9.14, 0.10, 0.11, 0.12"
+Pkg = "1.10"
 PrecompileTools = "1.2"
+REPL = "1.10"
 SafeTestsets = "0.1"
 TOML = "1.0.3"
+Test = "1.10"
 julia = "1.10"
 
 [extras]

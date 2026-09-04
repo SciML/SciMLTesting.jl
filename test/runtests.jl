@@ -1,11 +1,19 @@
 using SciMLTesting
 using Test
 using Pkg
+using TOML
 # Aqua and ExplicitImports are direct SciMLTesting deps, so they load with it. `using
 # JET` triggers SciMLTesting's JET weakdep extension, whose `__init__` registers JET
 # with SciMLTesting (see the "JET auto-detection" testset); JET must be available in
 # the test env for the extension to load.
 using JET
+
+@testset "stdlib compat entries" begin
+    project = TOML.parsefile(joinpath(pkgdir(SciMLTesting), "Project.toml"))
+    for dependency in ("Pkg", "REPL", "Test")
+        @test haskey(project["compat"], dependency)
+    end
+end
 
 # Stand-in modules so the test exercises run_qa without a hard dependency on
 # Aqua/JET: they only need to expose the methods run_qa calls. Modules must be
