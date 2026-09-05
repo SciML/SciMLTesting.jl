@@ -240,9 +240,8 @@ function _load_real_jet_fixture()
     return Base.require(REAL_JET_FIXTURE_PKGID)
 end
 
-# Reexports an undocumented external module and an undocumented external function
-# next to an undocumented local name, so the docstrings check can be shown to exempt
-# the module and only the module.
+# Reexports an undocumented external module and function next to an undocumented local
+# name, exercising standalone docs checks and run_qa allow-list routing independently.
 module UndocumentedModuleReexportFixture
     import ..ReexportOwnerFixture: OwnedModule, owned_function
     export OwnedModule, owned_function, local_undocumented
@@ -1801,17 +1800,22 @@ using ExplicitImports
         @test c[:pass] == 1 && c[:fail] == 0 && c[:error] == 0
 
         c = counts_of() do
+            docs_src = mktempdir()
             run_qa(
                 UndocumentedModuleReexportFixture;
                 Aqua = nothing,
                 JET = nothing,
                 ExplicitImports = nothing,
                 explicit_imports = false,
-                api_docs_kwargs = (; rendered = false, ignore = (:local_undocumented,)),
+                api_docs_kwargs = (;
+                    docs_src,
+                    ignore = (:local_undocumented,),
+                    rendered_ignore = (:local_undocumented,),
+                ),
                 reexports_allow = (:OwnedModule, :owned_function),
             )
         end
-        @test c[:pass] == 1 && c[:fail] == 1 && c[:error] == 0
+        @test c[:pass] == 3 && c[:fail] == 0 && c[:error] == 0
 
         c = counts_of() do
             run_qa(

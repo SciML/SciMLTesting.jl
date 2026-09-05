@@ -760,8 +760,8 @@ Each tool runs if it is both available and enabled:
   * `api_docs` ⇒ the public-API documentation check (see [`run_api_docs`](@ref)): every
     package-owned exported/`public` name has a docstring and every locally rendered name
     appears in the manual unless `api_docs_kwargs` explicitly sets `rendered = false`.
-    Names approved through `reexports_allow` remain the owning package's documentation
-    responsibility.
+    Names approved through `reexports_allow` are excluded from the facade's docstring
+    and rendered checks; their defining packages remain responsible for documenting them.
   * `check_reexports` ⇒ fail when the package publicly exposes a binding or alias
     owned outside its module hierarchy, except names listed in `reexports_allow`.
 
@@ -775,8 +775,9 @@ document a repo's public API, or curate exceptions via `api_docs_kwargs` (`ignor
 forwarded to [`run_api_docs`](@ref) (e.g. `rendered`, `ignore`, `docstrings_broken`).
 `explicit_imports` and `check_reexports` default to **`true`**. Packages with unavoidable
 dependency exceptions provide their per-check ignore-lists through `ei_kwargs`, while
-facade packages list intentional public reexports in `reexports_allow`. Approval permits
-the facade binding but does not waive documentation checks on the definition's owner.
+facade packages list intentional public reexports in `reexports_allow`. Approval excludes
+the external binding from the facade's documentation checks without exempting a local name
+that merely appears in the allow-list.
 Setting an enable flag `true` while its module is unavailable is a configuration error
 and throws an `ArgumentError`. The whole thing runs inside a `@testset` named `testset`.
 
@@ -942,7 +943,22 @@ function run_qa(
             end
         end
         explicit_imports && run_explicit_imports(pkg, ExplicitImports; ei_kwargs, ei_broken)
-        api_docs && run_api_docs(pkg; api_docs_kwargs...)
+        if api_docs
+            allowed_reexports = Set(Symbol.(reexports_allow))
+            approved_reexports = filter(
+                name -> name in allowed_reexports, public_reexports(pkg)
+            )
+            effective_api_docs_kwargs = merge(
+                api_docs_kwargs,
+                (;
+                    ignore = (get(api_docs_kwargs, :ignore, ())..., approved_reexports...),
+                    rendered_ignore = (
+                        get(api_docs_kwargs, :rendered_ignore, ())..., approved_reexports...,
+                    ),
+                ),
+            )
+            run_api_docs(pkg; effective_api_docs_kwargs...)
+        end
         if check_reexports
             reexported = public_reexports(pkg; allow = reexports_allow)
             @testset "No unapproved public reexports" begin
