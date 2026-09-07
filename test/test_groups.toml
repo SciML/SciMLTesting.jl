@@ -1,0 +1,9 @@
+[Core]
+versions = ["lts", "1", "pre"]
+os = ["ubuntu-latest", "macos-latest", "windows-latest"]
+
+["Core 32-bit"]
+group = "Core"
+versions = ["1"]
+os = ["ubuntu-latest"]
+arch = "x86"
