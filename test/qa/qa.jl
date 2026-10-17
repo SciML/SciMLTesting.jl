@@ -1,4 +1,5 @@
 using SciMLTesting
+using ExplicitImports
 using JET
 using Test
 
@@ -23,3 +24,18 @@ run_qa(
         ),
     ),
 )
+
+# `throw = false` needs ExplicitImports 1.15, above the package's `ExplicitImports = "1"`
+# floor that the Downgrade lane resolves, so this check belongs to QA rather than Core.
+@testset "local public replacements for qualified accesses" begin
+    result = ExplicitImports.check_all_qualified_accesses_are_public(
+        SciMLTesting;
+        ignore = SciMLTesting.BASE_BROADCAST_EXTENSION_HOOKS,
+        throw = false,
+    )
+    flagged = result === nothing ? Symbol[] :
+        Symbol[row.name for row in result.bad_imports]
+    @test !(:eval in flagged)
+    @test !(:structdiff in flagged)
+    @test !(:parseall in flagged)
+end

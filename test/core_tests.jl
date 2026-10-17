@@ -1664,6 +1664,15 @@ using ExplicitImports
         c = autodocs_counts("Pages = [\"core_tests.jl\"]\n")
         @test c[:fail] == 1
 
+        # A semicolon-joined line is one top-level expression (Expr(:toplevel, ...)),
+        # which Documenter ignores as a non-assignment. An empty `Modules = []` line
+        # before it must not be overwritten by flattening that line into assignments —
+        # otherwise the rendered check falsely credits the public API.
+        c = autodocs_counts(
+            "Modules = []\nModules = [Main.ScopedAutoDocsFixture]; Private = false\n",
+        )
+        @test c[:fail] == 1
+
         # A public name whose docstring the docsystem cannot locate falls back to the
         # package itself, so a module-scoped block still covers ApiFixture's
         # undocumented exports rather than reporting them twice.
